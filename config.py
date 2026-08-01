@@ -1,7 +1,6 @@
 """
-Конфигурация сервиса. Всё берётся из переменных окружения — никаких
-паролей и токенов в коде. В Cloud Run секреты подключаются через
-Secret Manager как env vars (см. README.md, шаг "Секреты").
+Конфигурация сервиса. Всё берётся из переменных окружения (в GitHub
+Actions — из Secrets) — никаких паролей и токенов в коде.
 """
 import os
 from datetime import date
@@ -23,15 +22,18 @@ M2M_USERNAME = os.environ.get("M2M_USERNAME")
 M2M_PASSWORD = os.environ.get("M2M_PASSWORD")
 M2M_TOKEN = os.environ.get("M2M_TOKEN")  # опционально, как запасной способ входа
 
-# --- Хранилище (Google Cloud Storage) ---
-GCS_BUCKET = _require("GCS_BUCKET")
+# --- Google Drive (замена Google Cloud Storage) ---
+DRIVE_CLIENT_ID = _require("DRIVE_CLIENT_ID")
+DRIVE_CLIENT_SECRET = _require("DRIVE_CLIENT_SECRET")
+DRIVE_REFRESH_TOKEN = _require("DRIVE_REFRESH_TOKEN")
+DRIVE_ROOT_FOLDER_ID = _require("DRIVE_ROOT_FOLDER_ID")  # id папки S2_monitoring на Диске
 
-# Пути ВНУТРИ бакета (не локальные!) до входных данных.
-# Загрузите эти файлы в бакет один раз перед первым запуском (см. README).
+# Пути ВНУТРИ этой папки на Диске (не локальные!) до входных данных.
+# Загружаются один раз через setup_drive.py перед первым запуском.
 AOI_GEOJSON_BLOB = os.environ.get("AOI_GEOJSON_BLOB", "config/All_ROI_2026_2.geojson")
 GRID_GEOJSON_BLOB = os.environ.get("GRID_GEOJSON_BLOB", "config/GRID_Landsat.geojson")
 
-# Префиксы для выходных данных внутри бакета
+# Подпапки для выходных данных внутри корневой папки на Диске
 MODIS_PREFIX = os.environ.get("MODIS_PREFIX", "modis")
 LOGS_PREFIX = os.environ.get("LOGS_PREFIX", "logs")
 STATE_BLOB = os.environ.get("STATE_BLOB", "state/previous_state.json")
@@ -44,8 +46,8 @@ NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", SMTP_USER)
 # --- Прочее ---
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")
 
-# Дата мониторинга: по умолчанию — сегодня, можно переопределить env-переменной
-# (удобно для ручного теста конкретного дня)
+# Дата мониторинга: по умолчанию — сегодня, можно переопределить
+# переменной окружения (удобно для ручного теста конкретного дня)
 MONITOR_DATE = os.environ.get("MONITOR_DATE") or date.today().isoformat()
 
 # Сколько зон интереса обрабатывать параллельно за один прогон
