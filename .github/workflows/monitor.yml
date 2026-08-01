@@ -1,0 +1,44 @@
+name: S2 Monitor
+
+on:
+  schedule:
+    # Каждые 10 минут. Время в UTC (GitHub Actions не поддерживает
+    # часовые пояса в cron) — сам скрипт переводит время в МСК
+    # внутри логов через переменную TIMEZONE.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}   # позволяет запустить вручную кнопкой в Actions
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9   # прогон должен укладываться в 10-минутный интервал
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitoring cycle
+        env:
+          COPERNICUS_USERNAME: ${{ secrets.COPERNICUS_USERNAME }}
+          COPERNICUS_PASSWORD: ${{ secrets.COPERNICUS_PASSWORD }}
+          M2M_USERNAME: ${{ secrets.M2M_USERNAME }}
+          M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
+          M2M_TOKEN: ${{ secrets.M2M_TOKEN }}
+          DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          DRIVE_REFRESH_TOKEN: ${{ secrets.DRIVE_REFRESH_TOKEN }}
+          DRIVE_ROOT_FOLDER_ID: ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          TIMEZONE: "Europe/Moscow"
+        run: python monitor.py
