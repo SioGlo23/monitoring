@@ -11,6 +11,7 @@ import requests
 from shapely.geometry import shape
 
 import config
+import utils
 
 logger = logging.getLogger("s2monitor.usgs_m2m")
 
@@ -116,6 +117,20 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         seen_pr.add(scene_pr)
         geo_fp = json.loads(gpd.GeoSeries([grid_geom]).to_json())["features"][0]["geometry"]
 
+        # Start Time из метаданных сцены. У M2M это temporalCoverage.startDate;
+        # если вдруг отсутствует — берём хотя бы дату (без времени) из displayId.
+        temporal = scene.get("temporalCoverage") or {}
+        start_iso = temporal.get("startDate")
+        if start_iso:
+            start_time_msk = utils.to_local_readable(start_iso)
+        else:
+            date_part = parts[3] if len(parts) > 3 else ""
+            start_time_msk = (
+                f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
+                if len(date_part) >= 8
+                else "—"
+            )
+
         filtered.append(
             {
                 "Name": display_id,
@@ -124,6 +139,7 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
                 "PR": scene_pr,
                 "cloud_cover": scene.get("cloudCover", "N/A"),
                 "scene_date": parts[3] if len(parts) > 3 else "Unknown",
+                "start_time_msk": start_time_msk,
             }
         )
 
