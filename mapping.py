@@ -58,8 +58,9 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
             "properties": {
                 "scene_name": p.get("Name", "Unknown"),
                 "scene_id": p.get("Id", "No ID"),
-                "discovered_msk": p.get("discovered_msk", "—"),
+                "start_time_msk": p.get("start_time_msk", "—"),
                 "published_msk": p.get("published_msk", "—"),
+                "discovered_msk": p.get("discovered_msk", "—"),
             },
         }
         for prods in current_s2.values() for p in prods if p.get("GeoFootprint")
@@ -70,8 +71,8 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
             name="Sentinel-2 L1C",
             style_function=lambda x: {"color": "#8B00FF", "weight": 2.5, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "scene_id", "published_msk", "discovered_msk"],
-                aliases=["Сцена:", "ID:", "Опубликовано:", "Обнаружено:"],
+                fields=["scene_name", "scene_id", "start_time_msk", "published_msk", "discovered_msk"],
+                aliases=["Сцена:", "ID:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):"],
             ),
             show=True,
         ).add_to(m)
@@ -85,7 +86,7 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
                 "scene_id": p.get("Id", "No ID"),
                 "PR": p.get("PR", "—"),
                 "cloud_cover": str(p.get("cloud_cover", "N/A")) + "%",
-                "scene_date": p.get("scene_date", "—"),
+                "start_time_msk": p.get("start_time_msk", "—"),
                 "discovered_msk": p.get("discovered_msk", "—"),
             },
         }
@@ -97,8 +98,8 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
             name="Landsat 8/9 Level-1",
             style_function=lambda x: {"color": "#FF8C00", "weight": 2.5, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "PR", "scene_date", "cloud_cover", "discovered_msk"],
-                aliases=["Сцена:", "PR:", "Дата:", "Облачность:", "Обнаружено:"],
+                fields=["scene_name", "scene_id", "PR", "cloud_cover", "start_time_msk", "discovered_msk"],
+                aliases=["Сцена:", "ID:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):"],
             ),
             show=True,
         ).add_to(m)
