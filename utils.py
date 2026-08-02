@@ -17,6 +17,17 @@ def to_local_timestamp(iso_string: str) -> str:
     return dt.astimezone(_tz).strftime("%Y%m%dT%H%M%S")
 
 
+def to_local_readable(iso_string: str) -> str:
+    """Дата+время в читаемом виде для писем/UI, например '2026-08-01 14:23:05'."""
+    if not iso_string:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+    except ValueError:
+        return "—"
+    return dt.astimezone(_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def retry(fn, attempts: int = 3, delay_seconds: float = 2.0, logger=None, what: str = "operation"):
     """Простой ретрай с линейной паузой для нестабильных внешних API."""
     import time
