@@ -1,7 +1,16 @@
 """
 Уведомления. Браузерные Notification/alert из исходного ноутбука убраны —
-на сервере без браузера они бессмысленны. Email оставлен через SMTP
-с app password (тем же способом, что и раньше, но пароль — из env).
+на сервере без браузера они бессмысленны. Email — через SMTP с app
+password (пароль — из env).
+
+В письме — только ID сцен (кратко, для быстрого просмотра). Полные
+данные (Start Time, время публикации, время обнаружения — всё по
+МСК) сохраняются в JSON-логе и на карте (HTML), сюда не дублируются.
+
+Структура письма:
+  1. Новые снимки за этот прогон (сгруппированы по заказу)
+  2. Все остальные снимки, которые уже были известны раньше
+     (тоже по заказам, для полной картины дня)
 """
 import logging
 import smtplib
@@ -12,25 +21,58 @@ import config
 logger = logging.getLogger("s2monitor.notifier")
 
 
-def notify_new_scenes(changed_info: dict, map_url: str | None) -> None:
-    if not changed_info:
+def _sorted_zakazy(keys):
+    try:
+        return sorted(keys, key=lambda z: int(z))
+    except (TypeError, ValueError):
+        return sorted(keys, key=str)
+
+
+def _format_id_line(p: dict, kind: str) -> str:
+    return f"  • [{kind}] ID: {p.get('Id', '—')}"
+
+
+def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url: str | None) -> None:
+    all_zakazy = _sorted_zakazy(set(current_s2.keys()) | set(current_landsat.keys()))
+
+    new_block, old_block = [], []
+    zakazy_with_new = 0
+
+    for zakaz in all_zakazy:
+        s2_list = current_s2.get(zakaz, [])
+        l_list = current_landsat.get(zakaz, [])
+
+        s2_new = [p for p in s2_list if p.get("is_new")]
+        s2_old = [p for p in s2_list if not p.get("is_new")]
+        l_new = [p for p in l_list if p.get("is_new")]
+        l_old = [p for p in l_list if not p.get("is_new")]
+
+        if s2_new or l_new:
+            zakazy_with_new += 1
+            new_block.append(f"Заказ {zakaz}:")
+            new_block += [_format_id_line(p, "S2") for p in s2_new]
+            new_block += [_format_id_line(p, "Landsat") for p in l_new]
+
+        if s2_old or l_old:
+            old_block.append(f"Заказ {zakaz}:")
+            old_block += [_format_id_line(p, "S2") for p in s2_old]
+            old_block += [_format_id_line(p, "Landsat") for p in l_old]
+
+    if not new_block:
+        # Уведомление вызывается только когда changed_info непустой,
+        # но на всякий случай — если вдруг блока новых нет, письмо не шлём.
         return
 
-    lines = ["Появились новые спутниковые данные:"]
-    for zakaz, info in changed_info.items():
-        parts = []
-        if info.get("s2_new"):
-            parts.append(f"S2: {len(info['s2_new'])}")
-        if info.get("landsat_new"):
-            parts.append(f"Landsat: {len(info['landsat_new'])}")
-        if parts:
-            lines.append(f"• Заказ {zakaz} — {', '.join(parts)} новых сцен")
+    body_parts = ["НОВЫЕ СНИМКИ:", ""] + new_block
+
+    if old_block:
+        body_parts += ["", "-" * 40, "", "УЖЕ БЫЛИ ИЗВЕСТНЫ РАНЕЕ (для справки):", ""] + old_block
 
     if map_url:
-        lines.append(f"\nКарта: {map_url}")
+        body_parts += ["", f"Карта (полные данные по каждой сцене): {map_url}"]
 
-    body = "\n".join(lines)
-    subject = f"Новые сцены S2/Landsat — {len(changed_info)} заказ(ов)"
+    body = "\n".join(body_parts)
+    subject = f"Новые сцены S2/Landsat — {zakazy_with_new} заказ(ов)"
 
     if not (config.SMTP_USER and config.SMTP_APP_PASSWORD and config.NOTIFY_EMAIL):
         logger.warning("SMTP не настроен — письмо не отправлено. Текст уведомления:\n%s", body)
