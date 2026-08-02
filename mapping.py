@@ -108,13 +108,17 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
     return m
 
 
-def save_map(m: "folium.Map", timestamp: str, run_label: str) -> str | None:
+def save_map(m: "folium.Map", cycle_ts: str, cycle_number: int) -> str | None:
+    """Сохраняет карту как '<TIMESTAMP>_<NNN>_cover.html', например
+    '20260802T140453_001_cover.html'. Номер обнуляется каждый день —
+    см. state_store.next_cycle_number."""
     if m is None:
         return None
     storage.ensure_local_dir(config.LOCAL_TMP_DIR)
-    local_path = os.path.join(config.LOCAL_TMP_DIR, f"{timestamp}_{run_label}_map.html")
+    filename = f"{cycle_ts}_{cycle_number:03d}_cover.html"
+    local_path = os.path.join(config.LOCAL_TMP_DIR, filename)
     m.save(local_path)
-    blob_path = f"{config.LOGS_PREFIX}/{timestamp}_{run_label}_map.html"
+    blob_path = f"{config.LOGS_PREFIX}/{filename}"
     gs_path = storage.upload_file(local_path, blob_path, content_type="text/html")
     os.remove(local_path)
 
