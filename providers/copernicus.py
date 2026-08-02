@@ -71,7 +71,11 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
             footprint = shape(p["GeoFootprint"])
             if aoi_shape.intersects(footprint):
                 pub_date = p.get("PublicationDate") or p.get("IngestionDate") or ""
-                p["published_msk"] = utils.to_local_timestamp(pub_date)
+                p["published_msk"] = utils.to_local_readable(pub_date)
+                # Start Time из метаданных — фактическое время съёмки (ContentDate/Start),
+                # а не дата публикации/обнаружения.
+                content_date = p.get("ContentDate") or {}
+                p["start_time_msk"] = utils.to_local_readable(content_date.get("Start"))
                 filtered.append(p)
 
     logger.info("Заказ %s: найдено %s снимков S2 после фильтрации", zakaz, len(filtered))
