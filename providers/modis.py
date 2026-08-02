@@ -1,7 +1,7 @@
 """
 MODIS Terra (7-2-1) через NASA GIBS WMS. Логика скачивания, отбраковки
 пустых сцен и ZSTD-сжатия — как в исходном ноутбуке. Итоговый файл
-загружается в GCS вместо Google Drive.
+загружается на Google Drive.
 """
 import logging
 import os
@@ -33,12 +33,12 @@ def _is_empty(filepath: str, left_columns: int = 4) -> bool:
 
 
 def download_for_aoi(zakaz, aoi_shape, date_str: str) -> str | None:
-    """Скачивает MODIS для AOI (буфер 5000 м), загружает в GCS. Возвращает gs:// путь или None."""
+    """Скачивает MODIS для AOI (буфер 5000 м), загружает на Google Drive. Возвращает ссылку или None."""
     blob_path = f"{config.MODIS_PREFIX}/zakaz_{zakaz}_{date_str}_MODIS_721.tif"
 
     if storage.blob_exists(blob_path):
-        logger.info("MODIS для zakaz_%s уже есть в бакете, пропускаем скачивание", zakaz)
-        return f"gs://{config.GCS_BUCKET}/{blob_path}"
+        logger.info("MODIS для zakaz_%s уже есть на Диске, пропускаем скачивание", zakaz)
+        return f"drive:{blob_path}"
 
     utm_shape = transform(_transform_to_utm, aoi_shape)
     buffered = transform(_transform_back, utm_shape.buffer(5000))
