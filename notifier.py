@@ -3,9 +3,10 @@
 на сервере без браузера они бессмысленны. Email — через SMTP с app
 password (пароль — из env).
 
-В письме — только ID сцен (кратко, для быстрого просмотра). Полные
-данные (Start Time, время публикации, время обнаружения — всё по
-МСК) сохраняются в JSON-логе и на карте (HTML), сюда не дублируются.
+В письме — только название каждой сцены (кратко, для быстрого
+просмотра). Полные данные (Start Time, время публикации, время
+обнаружения — всё по МСК) сохраняются в JSON-логе и на карте (HTML),
+сюда не дублируются.
 
 Структура письма:
   1. Новые снимки за этот прогон (сгруппированы по заказу)
@@ -28,8 +29,8 @@ def _sorted_zakazy(keys):
         return sorted(keys, key=str)
 
 
-def _format_id_line(p: dict, kind: str) -> str:
-    return f"  • [{kind}] ID: {p.get('Id', '—')}"
+def _format_line(p: dict, kind: str) -> str:
+    return f"  • [{kind}] {p.get('Name', '—')}"
 
 
 def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url: str | None) -> None:
@@ -50,13 +51,13 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url: str | No
         if s2_new or l_new:
             zakazy_with_new += 1
             new_block.append(f"Заказ {zakaz}:")
-            new_block += [_format_id_line(p, "S2") for p in s2_new]
-            new_block += [_format_id_line(p, "Landsat") for p in l_new]
+            new_block += [_format_line(p, "S2") for p in s2_new]
+            new_block += [_format_line(p, "Landsat") for p in l_new]
 
         if s2_old or l_old:
             old_block.append(f"Заказ {zakaz}:")
-            old_block += [_format_id_line(p, "S2") for p in s2_old]
-            old_block += [_format_id_line(p, "Landsat") for p in l_old]
+            old_block += [_format_line(p, "S2") for p in s2_old]
+            old_block += [_format_line(p, "Landsat") for p in l_old]
 
     if not new_block:
         # Уведомление вызывается только когда changed_info непустой,
