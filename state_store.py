@@ -39,12 +39,13 @@ def next_cycle_number(date_str: str) -> int:
 
 def append_run_history(line: str) -> None:
     """Добавляет одну строку в единый файл истории всех прогонов
-    (logs/run_history.log) — растёт со временем, по одной строке на
-    каждый запуск пайплайна, независимо от того, писался ли полный
-    лог/карта в этот раз."""
+    (logs/run_history.log) — по одной строке на каждый запуск
+    пайплайна, независимо от того, писался ли полный лог/карта в этот
+    раз. Новые записи добавляются СВЕРХУ — самый свежий прогон всегда
+    первая строка файла."""
     try:
         existing = storage.download_text(RUN_HISTORY_BLOB)
     except FileNotFoundError:
         existing = ""
-    updated = existing + line + "\n"
+    updated = line + "\n" + existing
     storage.upload_bytes(updated.encode("utf-8"), RUN_HISTORY_BLOB, content_type="text/plain; charset=utf-8")
