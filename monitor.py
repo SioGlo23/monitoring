@@ -168,6 +168,7 @@ def run_once() -> dict:
                 "s2": [
                     {
                         "id": p.get("Id"),
+                        "name": p.get("Name"),
                         "start_time_msk": p.get("start_time_msk"),
                         "published_msk": p.get("published_msk"),
                         "discovered_msk": p.get("discovered_msk"),
@@ -178,6 +179,7 @@ def run_once() -> dict:
                 "landsat": [
                     {
                         "id": p.get("Id"),
+                        "name": p.get("Name"),
                         "start_time_msk": p.get("start_time_msk"),
                         "discovered_msk": p.get("discovered_msk"),
                         "is_new": p.get("is_new", False),
