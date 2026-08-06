@@ -88,13 +88,16 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         },
     }
 
-    try:
+    def _do_request():
         resp = requests.post(_BASE + "scene-search", json=payload, headers=auth_headers, timeout=60)
         resp.raise_for_status()
-        results = resp.json().get("data", {}).get("results", [])
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Ошибка M2M API для заказа %s: %s", zakaz, exc)
-        return []
+        return resp.json().get("data", {}).get("results", [])
+
+    # См. комментарий в providers/copernicus.py про то, почему ошибка
+    # после ретраев пробрасывается, а не превращается в пустой список.
+    results = utils.retry(
+        _do_request, attempts=3, delay_seconds=3, logger=logger, what=f"M2M scene-search (заказ {zakaz})"
+    )
 
     filtered = []
     seen_pr = set()
