@@ -71,7 +71,20 @@ def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
     каждую AOI одновременно."""
     aoi_shape = shape(feat["geometry"])
 
-    s2_prods = copernicus.query_for_aoi(zakaz, feat, access_token, today_start, tomorrow)
+    try:
+        s2_prods = copernicus.query_for_aoi(zakaz, feat, access_token, today_start, tomorrow)
+    except Exception as exc:  # noqa: BLE001
+        # Запрос к Copernicus не удался даже после ретраев (см.
+        # providers/copernicus.py). НЕ считаем это "снимков нет" —
+        # иначе временный сетевой сбой затёр бы память о уже известных
+        # сценах, и они бы на следующем прогоне снова "нашлись" как
+        # новые. Вместо этого переносим прошлые данные без изменений.
+        logger.warning(
+            "Заказ %s: сбой запроса S2 (%s) — используем данные с прошлого прогона без изменений",
+            zakaz, exc,
+        )
+        s2_prods = [dict(p) for p in previous_s2_for_zakaz]
+
     old_s2_ids = {p.get("Id") for p in previous_s2_for_zakaz}
     for p in s2_prods:
         old_match = next((o for o in previous_s2_for_zakaz if o.get("Id") == p.get("Id")), None)
@@ -80,7 +93,15 @@ def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
 
     landsat_prods = []
     if m2m_session:
-        landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, target_date_str, grid_gdf)
+        try:
+            landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, target_date_str, grid_gdf)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Заказ %s: сбой запроса Landsat (%s) — используем данные с прошлого прогона без изменений",
+                zakaz, exc,
+            )
+            landsat_prods = [dict(p) for p in previous_landsat_for_zakaz]
+
         old_l_ids = {p.get("Id") for p in previous_landsat_for_zakaz}
         for p in landsat_prods:
             old_match = next((o for o in previous_landsat_for_zakaz if o.get("Id") == p.get("Id")), None)
