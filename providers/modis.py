@@ -15,6 +15,7 @@ from shapely.ops import transform
 
 import config
 import storage
+import utils
 
 logger = logging.getLogger("s2monitor.modis")
 
@@ -59,10 +60,20 @@ def download_for_aoi(zakaz, aoi_shape, date_str: str) -> str | None:
     tmp_final = os.path.join(config.LOCAL_TMP_DIR, f"zakaz_{zakaz}_{date_str}_final.tif")
 
     try:
-        r = requests.get(url, timeout=90)
-        r.raise_for_status()
+        def _do_request():
+            resp = requests.get(url, timeout=90)
+            resp.raise_for_status()
+            return resp.content
+
+        # В отличие от S2/Landsat, здесь безопасно просто вернуть None
+        # при неудаче — MODIS не хранит "память между прогонами", так
+        # что нечему затираться; ретраи здесь просто снижают число
+        # ложных пропусков из-за разовых сетевых сбоев.
+        content = utils.retry(
+            _do_request, attempts=3, delay_seconds=3, logger=logger, what=f"MODIS WMS (zakaz_{zakaz})"
+        )
         with open(tmp_raw, "wb") as f:
-            f.write(r.content)
+            f.write(content)
 
         if _is_empty(tmp_raw):
             logger.info("MODIS для zakaz_%s пуст (нет данных на эту дату) — пропускаем", zakaz)
