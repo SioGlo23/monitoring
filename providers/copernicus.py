@@ -57,14 +57,18 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
     }
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    try:
+    def _do_request():
         resp = requests.get(_PRODUCTS_URL, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Ошибка запроса S2 для заказа %s: %s", zakaz, exc)
-        return []
+        return resp.json().get("value", [])
 
-    products = resp.json().get("value", [])
+    # Ретраи на случай временного сбоя API. Если после всех попыток
+    # запрос так и не удался — исключение пробрасывается наверх, а не
+    # тихо превращается в "снимков нет" (иначе временный сбой сети
+    # выглядел бы как реальное исчезновение уже известных снимков и
+    # мог бы затереть память о них — см. обработку в monitor.py).
+    products = utils.retry(_do_request, attempts=3, delay_seconds=3, logger=logger, what=f"S2 query (заказ {zakaz})")
+
     filtered = []
     for p in products:
         if p.get("GeoFootprint"):
