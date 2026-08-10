@@ -1,7 +1,6 @@
 """
-Sentinel-2 через Copernicus Dataspace OData API.
-Логика запроса и фильтрации — как в исходном ноутбуке, вынесена в
-отдельный модуль и дополнена ретраями.
+Sentinel-2 через Copernicus Dataspace OData API. Логика запроса,
+геофильтрации и фильтрации по mrgs_tiles -- как в исходном ноутбуке.
 """
 import logging
 
@@ -39,7 +38,8 @@ def get_access_token() -> str:
 
 
 def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: str) -> list:
-    """Ищет сцены Sentinel-2 L1C, пересекающие AOI, за указанные сутки."""
+    """Ищет сцены Sentinel-2 L1C, пересекающие AOI, за указанные сутки,
+    и (если задан) фильтрует по списку ожидаемых тайлов mrgs_tiles."""
     aoi_shape = shape(feat["geometry"])
     minx, miny, maxx, maxy = aoi_shape.bounds
     bbox_wkt = f"POLYGON(({minx} {miny},{maxx} {miny},{maxx} {maxy},{minx} {maxy},{minx} {miny}))"
@@ -62,25 +62,28 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
         resp.raise_for_status()
         return resp.json().get("value", [])
 
-    # Ретраи на случай временного сбоя API. Если после всех попыток
-    # запрос так и не удался — исключение пробрасывается наверх, а не
-    # тихо превращается в "снимков нет" (иначе временный сбой сети
-    # выглядел бы как реальное исчезновение уже известных снимков и
-    # мог бы затереть память о них — см. обработку в monitor.py).
     products = utils.retry(_do_request, attempts=3, delay_seconds=3, logger=logger, what=f"S2 query (заказ {zakaz})")
+
+    mrgs_tiles = utils.parse_tile_list(feat.get("properties", {}).get("mrgs_tiles"))
 
     filtered = []
     for p in products:
-        if p.get("GeoFootprint"):
-            footprint = shape(p["GeoFootprint"])
-            if aoi_shape.intersects(footprint):
-                pub_date = p.get("PublicationDate") or p.get("IngestionDate") or ""
-                p["published_msk"] = utils.to_local_readable(pub_date)
-                # Start Time из метаданных — фактическое время съёмки (ContentDate/Start),
-                # а не дата публикации/обнаружения.
-                content_date = p.get("ContentDate") or {}
-                p["start_time_msk"] = utils.to_local_readable(content_date.get("Start"))
-                filtered.append(p)
+        if not p.get("GeoFootprint"):
+            continue
+        footprint = shape(p["GeoFootprint"])
+        if not aoi_shape.intersects(footprint):
+            continue
+
+        tile_code = utils.extract_s2_tile(p.get("Name", ""))
+        if mrgs_tiles and tile_code not in mrgs_tiles:
+            continue
+
+        pub_date = p.get("PublicationDate") or p.get("IngestionDate") or ""
+        p["published_msk"] = utils.to_local_readable(pub_date)
+        content_date = p.get("ContentDate") or {}
+        p["start_time_msk"] = utils.to_local_readable(content_date.get("Start"))
+        p["tile_code"] = tile_code
+        filtered.append(p)
 
     logger.info("Заказ %s: найдено %s снимков S2 после фильтрации", zakaz, len(filtered))
     return filtered
