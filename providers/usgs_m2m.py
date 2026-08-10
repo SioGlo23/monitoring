@@ -1,7 +1,7 @@
 """
-Landsat 8/9 через USGS M2M API. Логика та же, что в исходном
-ноутбуке (поиск сцен + сопоставление с GRID_Landsat), вынесена
-в отдельный модуль.
+Landsat 8/9 через USGS M2M API (только поиск сцен). Логика та же, что
+в исходном ноутбуке (поиск + сопоставление с GRID_Landsat), плюс
+опциональная фильтрация по pr_tile.
 """
 import json
 import logging
@@ -21,10 +21,12 @@ _HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
 }
+DATASET_NAME = "landsat_ot_c2_l1"
 
 
 def get_session():
-    """Логин в USGS M2M. Возвращает session_id или None, если Landsat недоступен."""
+    """Логин в USGS M2M. Возвращает session_id (X-Auth-Token) или None,
+    если Landsat в этом прогоне недоступен."""
     if config.M2M_USERNAME and config.M2M_PASSWORD:
         try:
             r = requests.post(
@@ -53,7 +55,7 @@ def get_session():
         except Exception as exc:  # noqa: BLE001
             logger.warning("USGS M2M: ошибка логина по токену: %s", exc)
 
-    logger.warning("USGS M2M: не удалось авторизоваться — Landsat в этом прогоне пропускается")
+    logger.warning("USGS M2M: не удалось авторизоваться -- Landsat в этом прогоне пропускается")
     return None
 
 
@@ -75,7 +77,7 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
     auth_headers = {"X-Auth-Token": session_id, **_HEADERS}
 
     payload = {
-        "datasetName": "landsat_ot_c2_l1",
+        "datasetName": DATASET_NAME,
         "maxResults": 20,
         "sceneFilter": {
             "acquisitionFilter": {"start": target_date_str, "end": target_date_str},
@@ -93,11 +95,11 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         resp.raise_for_status()
         return resp.json().get("data", {}).get("results", [])
 
-    # См. комментарий в providers/copernicus.py про то, почему ошибка
-    # после ретраев пробрасывается, а не превращается в пустой список.
     results = utils.retry(
         _do_request, attempts=3, delay_seconds=3, logger=logger, what=f"M2M scene-search (заказ {zakaz})"
     )
+
+    pr_tiles = utils.parse_tile_list(feat.get("properties", {}).get("pr_tile"))
 
     filtered = []
     seen_pr = set()
@@ -110,6 +112,11 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         if scene_pr in seen_pr or scene_pr not in grid_gdf["PR"].values:
             continue
 
+        # Если pr_tile задан в свойствах AOI -- берём только эти тайлы.
+        # Если не задан/пуст -- берём все, что пересекаются с AOI (как раньше).
+        if pr_tiles and scene_pr not in pr_tiles:
+            continue
+
         matched = grid_gdf[grid_gdf["PR"] == scene_pr]
         if matched.empty:
             continue
@@ -120,8 +127,6 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         seen_pr.add(scene_pr)
         geo_fp = json.loads(gpd.GeoSeries([grid_geom]).to_json())["features"][0]["geometry"]
 
-        # Start Time из метаданных сцены. У M2M это temporalCoverage.startDate;
-        # если вдруг отсутствует — берём хотя бы дату (без времени) из displayId.
         temporal = scene.get("temporalCoverage") or {}
         start_iso = temporal.get("startDate")
         if start_iso:
@@ -129,9 +134,7 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         else:
             date_part = parts[3] if len(parts) > 3 else ""
             start_time_msk = (
-                f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
-                if len(date_part) >= 8
-                else "—"
+                f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}" if len(date_part) >= 8 else "—"
             )
 
         filtered.append(
