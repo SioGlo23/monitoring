@@ -1,14 +1,12 @@
 """
-Обёртка над Google Drive API. Заменяет собой Google Cloud Storage —
-все файлы (растры, логи, карты, состояние) хранятся в одной папке на
-личном Google Drive пользователя, как и в исходном ноутбуке
-(drive.mount), но через официальный API с OAuth-refresh-токеном —
-без Cloud Storage и без биллинг-аккаунта.
+Обёртка над Google Drive API. Заменяет собой Google Cloud Storage --
+все файлы (растры, логи, карты, состояние, очередь заданий) хранятся
+в одной папке на личном Google Drive пользователя, через официальный
+API с OAuth-refresh-токеном.
 
 Все функции работают с "виртуальными путями" вида "logs/2026.../x.json"
-внутри корневой папки DRIVE_ROOT_FOLDER_ID — так же, как раньше работали
-blob-пути внутри бакета GCS. Папки создаются автоматически по мере
-необходимости.
+внутри корневой папки DRIVE_ROOT_FOLDER_ID. Папки создаются автоматически
+по мере необходимости.
 """
 import io
 import json
@@ -87,12 +85,26 @@ def _resolve_path(blob_path: str):
     return parent_id, filename
 
 
+def _resolve_folder(folder_path: str) -> str:
+    """Как _resolve_path, но весь путь целиком -- цепочка папок (без имени файла)."""
+    parts = [p for p in folder_path.strip("/").split("/") if p]
+    cache_key = "/".join(parts)
+    if cache_key in _folder_cache:
+        return _folder_cache[cache_key]
+
+    parent_id = config.DRIVE_ROOT_FOLDER_ID
+    for part in parts:
+        parent_id = _ensure_folder(part, parent_id)
+    _folder_cache[cache_key] = parent_id
+    return parent_id
+
+
 def blob_exists(blob_path: str) -> bool:
     folder_id, filename = _resolve_path(blob_path)
     return _find_child(filename, folder_id) is not None
 
 
-def download_text(blob_path: str) -> str:
+def download_bytes(blob_path: str) -> bytes:
     folder_id, filename = _resolve_path(blob_path)
     file_id = _find_child(filename, folder_id)
     if not file_id:
@@ -105,7 +117,11 @@ def download_text(blob_path: str) -> str:
     done = False
     while not done:
         _, done = downloader.next_chunk()
-    return buf.getvalue().decode("utf-8")
+    return buf.getvalue()
+
+
+def download_text(blob_path: str) -> str:
+    return download_bytes(blob_path).decode("utf-8")
 
 
 def download_json(blob_path: str, default=None):
@@ -115,7 +131,7 @@ def download_json(blob_path: str, default=None):
         return default
 
 
-def _upload_media(folder_id: str, filename: str, media, existing_id: str | None) -> str:
+def _upload_media(folder_id: str, filename: str, media, existing_id):
     service = _get_service()
     if existing_id:
         service.files().update(fileId=existing_id, media_body=media).execute()
@@ -150,6 +166,25 @@ def upload_file(local_path: str, blob_path: str, content_type: str = None) -> st
     file_id = _upload_media(folder_id, filename, media, existing_id)
     logger.info("Загружен файл на Google Drive: %s", blob_path)
     return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def list_files(folder_prefix: str) -> list:
+    """Список виртуальных путей 'folder_prefix/filename' для всех файлов
+    (не папок) внутри указанной папки. Папка создаётся, если её ещё нет --
+    тогда возвращается пустой список."""
+    folder_id = _resolve_folder(folder_prefix)
+    service = _get_service()
+    q = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+    res = service.files().list(q=q, spaces="drive", fields="files(id, name)").execute()
+    prefix_clean = folder_prefix.strip("/")
+    return [f"{prefix_clean}/{f['name']}" for f in res.get("files", [])]
+
+
+def delete_blob(blob_path: str) -> None:
+    folder_id, filename = _resolve_path(blob_path)
+    file_id = _find_child(filename, folder_id)
+    if file_id:
+        _get_service().files().delete(fileId=file_id).execute()
 
 
 def ensure_local_dir(path: str) -> None:
