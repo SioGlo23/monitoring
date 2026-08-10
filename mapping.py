@@ -1,4 +1,5 @@
-"""Интерактивная карта (MODIS + AOI + Sentinel-2 + Landsat) — как в исходном ноутбуке."""
+"""Интерактивная карта (MODIS + AOI + Sentinel-2 + Landsat) -- как в исходном ноутбуке.
+Без изменений в рамках этого обновления."""
 import logging
 import os
 
@@ -11,7 +12,7 @@ from shapely.geometry import shape
 logger = logging.getLogger("s2monitor.mapping")
 
 
-def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium.Map | None:
+def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
     geoms = [shape(feat["geometry"]) for feat in aoi_dict.values()]
     for prods in current_s2.values():
         geoms += [shape(p["GeoFootprint"]) for p in prods if p.get("GeoFootprint")]
@@ -108,10 +109,7 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict) -> folium
     return m
 
 
-def save_map(m: "folium.Map", cycle_ts: str, cycle_number: int) -> str | None:
-    """Сохраняет карту как '<TIMESTAMP>_<NNN>_cover.html', например
-    '20260802T140453_001_cover.html'. Номер обнуляется каждый день —
-    см. state_store.next_cycle_number."""
+def save_map(m, cycle_ts: str, cycle_number: int):
     if m is None:
         return None
     storage.ensure_local_dir(config.LOCAL_TMP_DIR)
@@ -122,8 +120,6 @@ def save_map(m: "folium.Map", cycle_ts: str, cycle_number: int) -> str | None:
     gs_path = storage.upload_file(local_path, blob_path, content_type="text/html")
     os.remove(local_path)
 
-    # Дополнительно храним "последнюю" карту под фиксированным именем —
-    # удобно открывать всегда одну и ту же ссылку, не ища свежий файл.
     latest_blob = f"{config.LOGS_PREFIX}/latest_map.html"
     tmp_latest = os.path.join(config.LOCAL_TMP_DIR, "latest_map.html")
     m.save(tmp_latest)
