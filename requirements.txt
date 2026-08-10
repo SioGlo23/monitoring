@@ -6,6 +6,8 @@ numpy==1.26.4
 pyproj==3.6.1
 folium==0.16.0
 pytz==2024.1
+scikit-image==0.24.0
+scipy==1.13.1
 google-api-python-client==2.140.0
 google-auth==2.34.0
 google-auth-httplib2==0.2.0
