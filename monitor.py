@@ -1,20 +1,20 @@
 """
-Один прогон мониторинга: то, что раньше было одной итерацией
-while-цикла в ноутбуке. GitHub Actions вызывает run_once() каждые
-10 минут — сам процесс не "живёт" между вызовами, поэтому все данные,
-которые раньше лежали в переменных Python (previous_s2 и т.п.),
-теперь читаются/пишутся через state_store (Google Drive).
+Один прогон детекции: то, что раньше было одной итерацией while-цикла
+в ноутбуке. GitHub Actions вызывает run_once() каждые 10 минут.
 
-Главное отличие от ноутбука: AOI обрабатываются ПАРАЛЛЕЛЬНО
-(ThreadPoolExecutor) — запросы к API и скачивание MODIS это
-I/O-bound работа, поэтому это может в разы ускорить один прогон.
+Главное отличие от исходного ноутбука: AOI обрабатываются ПАРАЛЛЕЛЬНО
+(ThreadPoolExecutor). Кроме поиска сцен S2/Landsat и скачивания MODIS,
+на каждом прогоне для каждой AOI также:
+  1. считается облачность MODIS внутри точного полигона AOI;
+  2. проверяется готовность (см. readiness.py) -- собран ли полный
+     ожидаемый комплект тайлов;
+  3. если готово и облачность в норме -- задание на тяжёлую обработку
+     (скачивание/композит/мозаика/вода/8-бит) ставится в очередь на
+     Google Drive, откуда его заберёт отдельный процесс process.py.
 
-MODIS проверяется/скачивается КАЖДЫЙ прогон (каждые 10 минут) для
-каждой AOI, независимо от того, пишется ли в этот раз общий лог —
-см. вызов modis.download_for_aoi() ниже. Если снимок MODIS за сутки
-ещё не полностью покрывает область (see providers/modis.py::_is_empty),
-он не сохраняется и попытка повторяется на следующих прогонах — так
-что "появится не сразу" для MODIS ожидаемо, это не сбой.
+monitor.py НИКОГДА сам не скачивает каналы и не строит мозаики -- это
+сознательное разделение, чтобы 10-минутный цикл детекции не блокировался
+долгой обработкой (см. process.py и .github/workflows/process.yml).
 """
 import json
 import logging
@@ -22,12 +22,13 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
-import geopandas as gpd
 from shapely.geometry import shape
 
+import aoi_source
 import config
 import mapping
 import notifier
+import readiness
 import state_store
 import storage
 import utils
@@ -37,50 +38,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("s2monitor.monitor")
 
 
-def _load_aoi_dict() -> dict:
-    raw = json.loads(storage.download_text(config.AOI_GEOJSON_BLOB))
-    aoi_dict = {}
-    for feat in raw.get("features", []):
-        zakaz = feat.get("properties", {}).get("zakaz")
-        if zakaz is not None:
-            aoi_dict[zakaz] = feat
-    return aoi_dict
-
-
-def _load_grid_gdf() -> "gpd.GeoDataFrame":
-    import tempfile
-
-    text = storage.download_text(config.GRID_GEOJSON_BLOB)
-    with tempfile.NamedTemporaryFile(suffix=".geojson", mode="w", delete=False, encoding="utf-8") as f:
-        f.write(text)
-        tmp_path = f.name
-    grid_gdf = gpd.read_file(tmp_path)
-    if grid_gdf.crs is None:
-        grid_gdf.set_crs("EPSG:4326", inplace=True)
-    else:
-        grid_gdf = grid_gdf.to_crs("EPSG:4326")
-    grid_gdf["PR"] = grid_gdf["PR"].astype(str).str.strip()
-    return grid_gdf
-
-
 def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
-                      today_start, tomorrow, target_date_str, monitor_date,
+                      today_start, tomorrow, monitor_date,
                       previous_s2_for_zakaz, previous_landsat_for_zakaz, discovered_readable):
-    """Вся работа по одной AOI — то, что цикл в ноутбуке делал строго
-    последовательно. Эта функция запускается в отдельном потоке на
-    каждую AOI одновременно."""
+    """Вся работа по одной AOI. Запускается в отдельном потоке на каждую
+    AOI одновременно."""
     aoi_shape = shape(feat["geometry"])
 
     try:
         s2_prods = copernicus.query_for_aoi(zakaz, feat, access_token, today_start, tomorrow)
     except Exception as exc:  # noqa: BLE001
-        # Запрос к Copernicus не удался даже после ретраев (см.
-        # providers/copernicus.py). НЕ считаем это "снимков нет" —
-        # иначе временный сетевой сбой затёр бы память о уже известных
-        # сценах, и они бы на следующем прогоне снова "нашлись" как
-        # новые. Вместо этого переносим прошлые данные без изменений.
+        # Не считаем сбой запроса "снимков нет" -- иначе временный
+        # сетевой сбой затёр бы память об уже известных сценах.
         logger.warning(
-            "Заказ %s: сбой запроса S2 (%s) — используем данные с прошлого прогона без изменений",
+            "Заказ %s: сбой запроса S2 (%s) -- используем данные с прошлого прогона без изменений",
             zakaz, exc,
         )
         s2_prods = [dict(p) for p in previous_s2_for_zakaz]
@@ -94,10 +65,10 @@ def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
     landsat_prods = []
     if m2m_session:
         try:
-            landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, target_date_str, grid_gdf)
+            landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, monitor_date, grid_gdf)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Заказ %s: сбой запроса Landsat (%s) — используем данные с прошлого прогона без изменений",
+                "Заказ %s: сбой запроса Landsat (%s) -- используем данные с прошлого прогона без изменений",
                 zakaz, exc,
             )
             landsat_prods = [dict(p) for p in previous_landsat_for_zakaz]
@@ -108,9 +79,12 @@ def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
             p["discovered_msk"] = old_match["discovered_msk"] if old_match else discovered_readable
             p["is_new"] = old_match is None
 
-    # MODIS проверяется/скачивается на КАЖДОМ прогоне, вне зависимости
-    # от heartbeat/изменений — см. docstring модуля.
-    modis_path = modis.download_for_aoi(zakaz, aoi_shape, monitor_date)
+    # MODIS + облачность проверяются на КАЖДОМ прогоне.
+    modis_path, cloud_percent = modis.download_for_aoi(zakaz, aoi_shape, monitor_date)
+    if cloud_percent is not None:
+        state_store.save_cloud_percent(zakaz, monitor_date, cloud_percent)
+    else:
+        cloud_percent = state_store.get_cloud_percent(zakaz, monitor_date)
 
     new_s2_ids = {p.get("Id") for p in s2_prods}
     new_l_ids = {p.get("Id") for p in landsat_prods}
@@ -120,20 +94,24 @@ def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
     if landsat_prods and (new_l_ids - {p.get("Id") for p in previous_landsat_for_zakaz}):
         changes["landsat_new"] = list(new_l_ids - {p.get("Id") for p in previous_landsat_for_zakaz})
 
-    return zakaz, s2_prods, landsat_prods, modis_path, changes
+    processing_decisions = readiness.evaluate_and_enqueue(
+        zakaz, feat, monitor_date, s2_prods, landsat_prods, cloud_percent
+    )
+
+    return zakaz, s2_prods, landsat_prods, modis_path, cloud_percent, changes, processing_decisions
 
 
 def run_once() -> dict:
-    """Точка входа: один полный прогон мониторинга по всем AOI."""
+    """Точка входа: один полный прогон детекции по всем AOI."""
     cycle_start = utils.now_local()
-    cycle_ts = cycle_start.strftime("%Y%m%dT%H%M%S")  # для внутренних нужд (не для имён файлов лога/карты)
+    cycle_ts = cycle_start.strftime("%Y%m%dT%H%M%S")
     cycle_readable = cycle_start.strftime("%Y-%m-%d %H:%M:%S")
-    cycle_date = cycle_start.strftime("%Y-%m-%d")  # календарная дата по TIMEZONE — для сброса нумерации
+    cycle_date = cycle_start.strftime("%Y-%m-%d")
     monitor_date = config.MONITOR_DATE
-    logger.info("=== Запуск прогона %s (дата мониторинга: %s) ===", cycle_ts, monitor_date)
+    logger.info("=== Запуск прогона детекции %s (дата мониторинга: %s) ===", cycle_ts, monitor_date)
 
-    aoi_dict = _load_aoi_dict()
-    grid_gdf = _load_grid_gdf()
+    aoi_dict = aoi_source.load_aoi_dict()
+    grid_gdf = aoi_source.load_grid_gdf()
     logger.info("Загружено %s зон интереса", len(aoi_dict))
 
     access_token = copernicus.get_access_token()
@@ -147,13 +125,15 @@ def run_once() -> dict:
     today_start = f"{monitor_date}T00:00:00Z"
     tomorrow = (date_obj + timedelta(days=1)).isoformat() + "T00:00:00Z"
 
-    current_s2, current_landsat, changed_info, modis_status = {}, {}, {}, {}
+    current_s2, current_landsat, changed_info, modis_status, cloud_by_zakaz, decisions_by_zakaz = (
+        {}, {}, {}, {}, {}, {}
+    )
 
     with ThreadPoolExecutor(max_workers=config.MAX_PARALLEL_AOI) as pool:
         futures = {
             pool.submit(
                 _process_one_aoi, zakaz, feat, access_token, m2m_session, grid_gdf,
-                today_start, tomorrow, monitor_date, monitor_date,
+                today_start, tomorrow, monitor_date,
                 prev_s2.get(str(zakaz), []), prev_landsat.get(str(zakaz), []), cycle_readable,
             ): zakaz
             for zakaz, feat in aoi_dict.items()
@@ -161,13 +141,16 @@ def run_once() -> dict:
         for future in as_completed(futures):
             zakaz = futures[future]
             try:
-                zakaz, s2_prods, landsat_prods, modis_path, changes = future.result()
+                zakaz, s2_prods, landsat_prods, modis_path, cloud_percent, changes, decisions = future.result()
             except Exception as exc:  # noqa: BLE001
                 logger.error("Заказ %s: прогон завершился с ошибкой: %s", zakaz, exc)
                 continue
             current_s2[str(zakaz)] = s2_prods
             current_landsat[str(zakaz)] = landsat_prods
             modis_status[str(zakaz)] = modis_path
+            cloud_by_zakaz[str(zakaz)] = cloud_percent
+            if decisions:
+                decisions_by_zakaz[str(zakaz)] = decisions
             if changes:
                 changed_info[str(zakaz)] = changes
 
@@ -184,42 +167,36 @@ def run_once() -> dict:
         "modis_available_count": modis_downloaded_count,
         "modis_total_aoi": len(aoi_dict),
         "changed_info": changed_info,
+        "cloud_percent_by_zakaz": cloud_by_zakaz,
+        "processing_decisions": decisions_by_zakaz,
         "zakaz_data": {
             zakaz: {
                 "s2": [
                     {
-                        "id": p.get("Id"),
-                        "name": p.get("Name"),
-                        "start_time_msk": p.get("start_time_msk"),
-                        "published_msk": p.get("published_msk"),
-                        "discovered_msk": p.get("discovered_msk"),
-                        "is_new": p.get("is_new", False),
+                        "id": p.get("Id"), "name": p.get("Name"),
+                        "start_time_msk": p.get("start_time_msk"), "published_msk": p.get("published_msk"),
+                        "discovered_msk": p.get("discovered_msk"), "is_new": p.get("is_new", False),
                     }
                     for p in current_s2.get(zakaz, [])
                 ],
                 "landsat": [
                     {
-                        "id": p.get("Id"),
-                        "name": p.get("Name"),
+                        "id": p.get("Id"), "name": p.get("Name"),
                         "start_time_msk": p.get("start_time_msk"),
-                        "discovered_msk": p.get("discovered_msk"),
-                        "is_new": p.get("is_new", False),
+                        "discovered_msk": p.get("discovered_msk"), "is_new": p.get("is_new", False),
                     }
                     for p in current_landsat.get(zakaz, [])
                 ],
                 "modis_available": bool(modis_status.get(zakaz)),
+                "cloud_percent": cloud_by_zakaz.get(zakaz),
             }
             for zakaz in aoi_dict
         },
     }
 
-    # Экономия хранилища/операций: полный лог+карту пишем не на каждый
-    # из 144 прогонов в сутки, а только когда реально что-то изменилось.
-    # Раз в час (в минуту :00-:09) дополнительно пишем "heartbeat" —
-    # чтобы можно было убедиться, что сервис вообще жив.
     is_heartbeat = cycle_start.minute < 10
-    map_gs_path = None
     cycle_number = None
+    map_gs_path = None
 
     if changed_info or is_heartbeat:
         cycle_number = state_store.next_cycle_number(cycle_date)
@@ -228,17 +205,14 @@ def run_once() -> dict:
         m = mapping.build_map(current_s2, current_landsat, aoi_dict)
         map_gs_path = mapping.save_map(m, cycle_ts, cycle_number)
     else:
-        logger.info("Изменений нет, не heartbeat-минута — лог и карта в этот раз не пишутся")
+        logger.info("Изменений нет, не heartbeat-минута -- полный лог и карта в этот раз не пишутся")
 
     if changed_info:
         logger.info("Обнаружены новые сцены: %s", list(changed_info.keys()))
         notifier.notify_new_scenes(current_s2, current_landsat, map_gs_path)
 
-    # Сохраняем состояние для следующего прогона
     state_store.save_state(current_s2, current_landsat)
 
-    # Единая история запусков — по одной строке на КАЖДЫЙ прогон,
-    # вне зависимости от того, писался ли полный лог.
     if changed_info:
         status_note = f"новые сцены ({len(changed_info)} заказ(ов)), лог #{cycle_number:03d}"
     elif is_heartbeat:
@@ -259,10 +233,10 @@ def run_once() -> dict:
         "total_landsat_scenes": log_data["total_landsat_scenes"],
         "modis_available_count": modis_downloaded_count,
         "new_scenes_found": bool(changed_info),
+        "processing_decisions": decisions_by_zakaz,
         "log_written": bool(changed_info or is_heartbeat),
-        "map_path": map_gs_path,
     }
-    logger.info("=== Прогон завершён: %s ===", result)
+    logger.info("=== Прогон детекции завершён: %s ===", result)
     return result
 
 
@@ -270,12 +244,10 @@ if __name__ == "__main__":
     try:
         run_once()
     except Exception as exc:  # noqa: BLE001
-        # Даже при падении фиксируем факт попытки в единой истории —
-        # чтобы её было видно, не заходя каждый раз в Actions.
         try:
             failure_line = f"{utils.now_local().strftime('%Y-%m-%d %H:%M:%S')} | FAILED | {exc}"
             state_store.append_run_history(failure_line)
         except Exception:  # noqa: BLE001
-            pass  # если даже запись истории не удалась — не мешаем исходной ошибке всплыть
+            pass
         traceback.print_exc()
         raise
