@@ -52,6 +52,10 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             icon=folium.DivIcon(html=f'<div style="font-size:13pt;color:blue;font-weight:bold;">{zakaz}</div>'),
         ).add_to(m)
 
+    def _cloud_label(p: dict) -> str:
+        cc = p.get("cloud_cover")
+        return f"{cc}%" if isinstance(cc, (int, float)) else "нет данных"
+
     s2_features = [
         {
             "type": "Feature",
@@ -59,9 +63,11 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             "properties": {
                 "scene_name": p.get("Name", "Unknown"),
                 "scene_id": p.get("Id", "No ID"),
+                "cloud_cover_label": _cloud_label(p),
                 "start_time_msk": p.get("start_time_msk", "—"),
                 "published_msk": p.get("published_msk", "—"),
                 "discovered_msk": p.get("discovered_msk", "—"),
+                "quicklook_link": p.get("quicklook_link") or "—",
             },
         }
         for prods in current_s2.values() for p in prods if p.get("GeoFootprint")
@@ -72,8 +78,8 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             name="Sentinel-2 L1C",
             style_function=lambda x: {"color": "#8B00FF", "weight": 2.5, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "scene_id", "start_time_msk", "published_msk", "discovered_msk"],
-                aliases=["Сцена:", "ID:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):"],
+                fields=["scene_name", "scene_id", "cloud_cover_label", "start_time_msk", "published_msk", "discovered_msk", "quicklook_link"],
+                aliases=["Сцена:", "ID:", "Облачность:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):", "Квиклук:"],
             ),
             show=True,
         ).add_to(m)
@@ -86,9 +92,10 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
                 "scene_name": p.get("Name", "Unknown"),
                 "scene_id": p.get("Id", "No ID"),
                 "PR": p.get("PR", "—"),
-                "cloud_cover": str(p.get("cloud_cover", "N/A")) + "%",
+                "cloud_cover_label": _cloud_label(p),
                 "start_time_msk": p.get("start_time_msk", "—"),
                 "discovered_msk": p.get("discovered_msk", "—"),
+                "quicklook_link": p.get("quicklook_link") or "—",
             },
         }
         for prods in current_landsat.values() for p in prods if p.get("GeoFootprint")
@@ -99,8 +106,8 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             name="Landsat 8/9 Level-1",
             style_function=lambda x: {"color": "#FF8C00", "weight": 2.5, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "scene_id", "PR", "cloud_cover", "start_time_msk", "discovered_msk"],
-                aliases=["Сцена:", "ID:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):"],
+                fields=["scene_name", "scene_id", "PR", "cloud_cover_label", "start_time_msk", "discovered_msk", "quicklook_link"],
+                aliases=["Сцена:", "ID:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):", "Квиклук:"],
             ),
             show=True,
         ).add_to(m)
