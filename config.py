@@ -107,5 +107,11 @@ EIGHTBIT_MINMAX = {
 # ожидаемых тайлов (mrgs_tiles / pr_tile) не задан.
 LANDSAT_STABILITY_CYCLES = int(os.environ.get("LANDSAT_STABILITY_CYCLES", "2"))
 
-# Порог облачности MODIS (%) -- выше этого значения обработка НЕ запускается.
-CLOUD_THRESHOLD_PERCENT = float(os.environ.get("CLOUD_THRESHOLD_PERCENT", "60"))
+# Порог средней облачности (%) по метаданным сцен -- выше этого значения
+# обработка НЕ запускается. Средняя считается по всем сценам, попавшим
+# в комплект по данному спутнику (для S2 -- по всем тайлам из mrgs_tiles,
+# для Landsat -- по всем найденным/из pr_tile).
+CLOUD_THRESHOLD_PERCENT = float(os.environ.get("CLOUD_THRESHOLD_PERCENT", "70"))
+
+# Куда сохранять квиклуки (загрубленные превью) новых сцен
+QUICKLOOKS_PREFIX = os.environ.get("QUICKLOOKS_PREFIX", "logs/quicklooks")
