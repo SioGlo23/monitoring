@@ -193,12 +193,13 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
 
 
 def download_quicklook(prod: dict, out_path: str) -> bool:
-    """Скачивает загрубленное превью (quicklook) сцены -- обычно лежит в
-    SAFE-пакете по пути preview/quick-look.png. Путь у разных baseline-
-    версий Sentinel-2 может немного отличаться, поэтому пробуем несколько
-    известных вариантов по очереди. Возвращает False (не бросает
-    исключение), если ни один вариант не сработал -- квиклук это
-    вспомогательная функция, её отсутствие не должно ронять детекцию."""
+    """Скачивает загрубленное превью (quicklook) сцены. Вместо угадывания
+    фиксированного пути -- парсит manifest.safe (как для каналов) и ищет
+    там файл превью (в href упоминается "preview" и расширение .png/.jpg)
+    -- надёжнее, чем захардкоженный путь, который может отличаться между
+    версиями обработки. Возвращает False (не бросает исключение), если
+    не получилось -- квиклук вспомогательная функция, её отсутствие не
+    должно ронять детекцию."""
     prod_name = prod["Name"]
     prod_id = prod["Id"]
     safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
@@ -206,19 +207,39 @@ def download_quicklook(prod: dict, out_path: str) -> bool:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cdse = _CdseSession()
 
-    candidates = [
-        [safe_name, "preview", "quick-look.png"],
-        [safe_name, "preview", "quicklook.png"],
-        [safe_name, "preview", "L1C_PVI.jpg"],
-    ]
-    for parts in candidates:
-        try:
-            cdse.probe_node_style(prod_id, parts[:-1])
-            if cdse.download_node_file(prod_id, parts, out_path):
-                return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Квиклук %s: вариант %s не сработал (%s)", prod_name[:40], "/".join(parts), exc)
-    return False
+    manifest_path = out_path + ".manifest.safe"
+    cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
+    if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
+        logger.warning("Квиклук %s: не удалось скачать manifest.safe", prod_name[:40])
+        return False
+
+    try:
+        root = ET.parse(manifest_path).getroot()
+    except ET.ParseError as e:
+        logger.warning("Квиклук %s: ошибка парсинга manifest.safe: %s", prod_name[:40], e)
+        os.remove(manifest_path)
+        return False
+
+    preview_rel_path = None
+    for elem in root.iter():
+        if elem.tag.endswith("fileLocation"):
+            href = elem.get("href", "")
+            low = href.lower()
+            if "preview" in low and low.endswith((".png", ".jpg", ".jpeg")):
+                preview_rel_path = href.lstrip("./")
+                break
+
+    os.remove(manifest_path)
+
+    if not preview_rel_path:
+        logger.warning("Квиклук %s: в manifest.safe не найден файл превью (preview/*.png|jpg)", prod_name[:40])
+        return False
+
+    parts = [safe_name] + [s for s in preview_rel_path.split("/") if s]
+    ok = cdse.download_node_file(prod_id, parts, out_path)
+    if not ok:
+        logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
+    return ok
 
 
 def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
