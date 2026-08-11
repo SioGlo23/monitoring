@@ -4,6 +4,15 @@
 в одной папке на личном Google Drive пользователя, через официальный
 API с OAuth-refresh-токеном.
 
+ВАЖНО про потоки: google-api-python-client (через httplib2) НЕ является
+потокобезопасным -- один и тот же service-объект нельзя дёргать из
+нескольких потоков одновременно (monitor.py обрабатывает несколько зон
+интереса параллельно через ThreadPoolExecutor). Поэтому ВСЕ функции
+этого модуля целиком сериализованы одним общим RLock: одновременно с
+Drive работает только один поток, остальные ждут своей очереди. Без
+этого возникает повреждение памяти на уровне C (сегфолты, "corrupted
+unsorted chunks", случайные SSL-ошибки) -- именно это и происходило.
+
 Все функции работают с "виртуальными путями" вида "logs/2026.../x.json"
 внутри корневой папки DRIVE_ROOT_FOLDER_ID. Папки создаются автоматически
 по мере необходимости.
@@ -12,6 +21,7 @@ import io
 import json
 import logging
 import os
+import threading
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -25,6 +35,11 @@ _SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 _service = None
 _folder_cache = {}  # "путь/до/папки" -> folder_id, чтобы не искать заново каждый раз
+
+# Один общий лок на ВСЕ обращения к Drive из этого процесса. RLock (не
+# Lock), т.к. функции вызывают друг друга изнутри уже захваченной
+# блокировки (например, download_json -> download_text -> download_bytes).
+_drive_lock = threading.RLock()
 
 
 def _get_service():
@@ -69,7 +84,8 @@ def _ensure_folder(name: str, parent_id: str) -> str:
 
 
 def _resolve_path(blob_path: str):
-    """'logs/2026.../file.json' -> (folder_id для logs/2026..., 'file.json')."""
+    """'logs/2026.../file.json' -> (folder_id для logs/2026..., 'file.json').
+    Вызывается только изнутри уже заблокированных публичных функций."""
     parts = blob_path.strip("/").split("/")
     filename = parts[-1]
     folder_parts = parts[:-1]
@@ -86,7 +102,8 @@ def _resolve_path(blob_path: str):
 
 
 def _resolve_folder(folder_path: str) -> str:
-    """Как _resolve_path, но весь путь целиком -- цепочка папок (без имени файла)."""
+    """Как _resolve_path, но весь путь целиком -- цепочка папок (без
+    имени файла). Тоже только изнутри уже заблокированных функций."""
     parts = [p for p in folder_path.strip("/").split("/") if p]
     cache_key = "/".join(parts)
     if cache_key in _folder_cache:
@@ -100,24 +117,26 @@ def _resolve_folder(folder_path: str) -> str:
 
 
 def blob_exists(blob_path: str) -> bool:
-    folder_id, filename = _resolve_path(blob_path)
-    return _find_child(filename, folder_id) is not None
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        return _find_child(filename, folder_id) is not None
 
 
 def download_bytes(blob_path: str) -> bytes:
-    folder_id, filename = _resolve_path(blob_path)
-    file_id = _find_child(filename, folder_id)
-    if not file_id:
-        raise FileNotFoundError(f"Не найден файл на Google Drive: {blob_path}")
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        file_id = _find_child(filename, folder_id)
+        if not file_id:
+            raise FileNotFoundError(f"Не найден файл на Google Drive: {blob_path}")
 
-    service = _get_service()
-    request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
+        service = _get_service()
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
 
 
 def download_text(blob_path: str) -> str:
@@ -129,9 +148,10 @@ def download_to_file(blob_path: str, local_path: str) -> None:
     восстановления уже готовых промежуточных/финальных артефактов
     (канал, композит, бандл, мозаика...), чтобы не пересчитывать их
     заново на каждом прогоне."""
+    data = download_bytes(blob_path)
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
     with open(local_path, "wb") as f:
-        f.write(download_bytes(blob_path))
+        f.write(data)
 
 
 def download_json(blob_path: str, default=None):
@@ -152,49 +172,67 @@ def _upload_media(folder_id: str, filename: str, media, existing_id):
 
 
 def upload_json(blob_path: str, data) -> None:
-    folder_id, filename = _resolve_path(blob_path)
-    existing_id = _find_child(filename, folder_id)
-    payload = json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    media = MediaIoBaseUpload(io.BytesIO(payload), mimetype="application/json; charset=utf-8")
-    _upload_media(folder_id, filename, media, existing_id)
-    logger.info("Сохранён JSON на Google Drive: %s", blob_path)
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        existing_id = _find_child(filename, folder_id)
+        payload = json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        media = MediaIoBaseUpload(io.BytesIO(payload), mimetype="application/json; charset=utf-8")
+        _upload_media(folder_id, filename, media, existing_id)
+        logger.info("Сохранён JSON на Google Drive: %s", blob_path)
 
 
 def upload_bytes(data: bytes, blob_path: str, content_type: str = None) -> str:
-    folder_id, filename = _resolve_path(blob_path)
-    existing_id = _find_child(filename, folder_id)
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type or "application/octet-stream")
-    file_id = _upload_media(folder_id, filename, media, existing_id)
-    return f"https://drive.google.com/file/d/{file_id}/view"
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        existing_id = _find_child(filename, folder_id)
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type or "application/octet-stream")
+        file_id = _upload_media(folder_id, filename, media, existing_id)
+        return f"https://drive.google.com/file/d/{file_id}/view"
 
 
-def upload_file(local_path: str, blob_path: str, content_type: str = None) -> str:
-    """Загружает локальный файл на Drive, возвращает ссылку на просмотр."""
-    folder_id, filename = _resolve_path(blob_path)
-    existing_id = _find_child(filename, folder_id)
-    media = MediaFileUpload(local_path, mimetype=content_type, resumable=True)
-    file_id = _upload_media(folder_id, filename, media, existing_id)
-    logger.info("Загружен файл на Google Drive: %s", blob_path)
-    return f"https://drive.google.com/file/d/{file_id}/view"
+def upload_file(local_path: str, blob_path: str, content_type: str = None, public: bool = False) -> str:
+    """Загружает локальный файл на Drive, возвращает ссылку. Если
+    public=True -- дополнительно открывает файл на просмотр по ссылке
+    ("anyone with the link") и возвращает ссылку в формате, пригодном
+    для встраивания как <img src="...">  (нужно для квиклуков на карте)."""
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        existing_id = _find_child(filename, folder_id)
+        media = MediaFileUpload(local_path, mimetype=content_type, resumable=True)
+        file_id = _upload_media(folder_id, filename, media, existing_id)
+        logger.info("Загружен файл на Google Drive: %s", blob_path)
+
+        if public:
+            try:
+                _get_service().permissions().create(
+                    fileId=file_id, body={"type": "anyone", "role": "reader"}
+                ).execute()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось открыть публичный доступ для %s: %s", blob_path, exc)
+            return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+        return f"https://drive.google.com/file/d/{file_id}/view"
 
 
 def list_files(folder_prefix: str) -> list:
     """Список виртуальных путей 'folder_prefix/filename' для всех файлов
     (не папок) внутри указанной папки. Папка создаётся, если её ещё нет --
     тогда возвращается пустой список."""
-    folder_id = _resolve_folder(folder_prefix)
-    service = _get_service()
-    q = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
-    res = service.files().list(q=q, spaces="drive", fields="files(id, name)").execute()
-    prefix_clean = folder_prefix.strip("/")
-    return [f"{prefix_clean}/{f['name']}" for f in res.get("files", [])]
+    with _drive_lock:
+        folder_id = _resolve_folder(folder_prefix)
+        service = _get_service()
+        q = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+        res = service.files().list(q=q, spaces="drive", fields="files(id, name)").execute()
+        prefix_clean = folder_prefix.strip("/")
+        return [f"{prefix_clean}/{f['name']}" for f in res.get("files", [])]
 
 
 def delete_blob(blob_path: str) -> None:
-    folder_id, filename = _resolve_path(blob_path)
-    file_id = _find_child(filename, folder_id)
-    if file_id:
-        _get_service().files().delete(fileId=file_id).execute()
+    with _drive_lock:
+        folder_id, filename = _resolve_path(blob_path)
+        file_id = _find_child(filename, folder_id)
+        if file_id:
+            _get_service().files().delete(fileId=file_id).execute()
 
 
 def ensure_local_dir(path: str) -> None:
