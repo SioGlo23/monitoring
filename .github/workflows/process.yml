@@ -19,6 +19,10 @@ on:
           - ""
           - "S2"
           - "L89"
+      date:
+        description: "Ручной запуск: дата снимков в формате ГГГГ-ММ-ДД (необязательно -- если не указать, берётся сегодняшняя)"
+        required: false
+        type: string
 
 # Отдельная группа concurrency от S2 Monitor -- детекция (monitor.yml)
 # и обработка (этот workflow) не блокируют друг друга и работают
@@ -72,4 +76,5 @@ jobs:
           TIMEZONE: "Europe/Moscow"
           ZAKAZ_OVERRIDE: ${{ github.event.inputs.zakaz }}
           SATELLITE_OVERRIDE: ${{ github.event.inputs.satellite }}
+          DATE_OVERRIDE: ${{ github.event.inputs.date }}
         run: python process.py
