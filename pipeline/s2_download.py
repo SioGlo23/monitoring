@@ -192,6 +192,35 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
     return out_dir
 
 
+def download_quicklook(prod: dict, out_path: str) -> bool:
+    """Скачивает загрубленное превью (quicklook) сцены -- обычно лежит в
+    SAFE-пакете по пути preview/quick-look.png. Путь у разных baseline-
+    версий Sentinel-2 может немного отличаться, поэтому пробуем несколько
+    известных вариантов по очереди. Возвращает False (не бросает
+    исключение), если ни один вариант не сработал -- квиклук это
+    вспомогательная функция, её отсутствие не должно ронять детекцию."""
+    prod_name = prod["Name"]
+    prod_id = prod["Id"]
+    safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cdse = _CdseSession()
+
+    candidates = [
+        [safe_name, "preview", "quick-look.png"],
+        [safe_name, "preview", "quicklook.png"],
+        [safe_name, "preview", "L1C_PVI.jpg"],
+    ]
+    for parts in candidates:
+        try:
+            cdse.probe_node_style(prod_id, parts[:-1])
+            if cdse.download_node_file(prod_id, parts, out_path):
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Квиклук %s: вариант %s не сработал (%s)", prod_name[:40], "/".join(parts), exc)
+    return False
+
+
 def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
     """Создаёт многоканальный GeoTIFF из отдельных {band}.jp2. Эталон
     разрешения -- канал с САМЫМ ВЫСОКИМ разрешением, остальные
