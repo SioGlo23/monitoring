@@ -43,6 +43,14 @@ MOSAICS_PREFIX = os.environ.get("MOSAICS_PREFIX", "Мозаики")
 WATER_PREFIX = os.environ.get("WATER_PREFIX", "Мозаики/Water")
 EIGHTBIT_PREFIX = os.environ.get("EIGHTBIT_PREFIX", "Мозаики/8bit")
 
+# Промежуточные артефакты -- имена ПАПОК подобраны так, чтобы точно
+# совпадать с +S2_L89.ipynb: если DRIVE_ROOT_FOLDER_ID указывает на ту
+# же папку "S2" на Диске, что использует ноутбук, всё это ляжет ровно
+# туда же, рядом с ROIs/, ZIP/, bands/, Composites/, Мозаики/, logs/.
+BANDS_PREFIX = os.environ.get("BANDS_PREFIX", "bands")
+ZIP_PREFIX = os.environ.get("ZIP_PREFIX", "ZIP")
+COMPOSITES_PREFIX = os.environ.get("COMPOSITES_PREFIX", "Composites")
+
 QUEUE_PENDING_PREFIX = os.environ.get("QUEUE_PENDING_PREFIX", "queue/pending")
 QUEUE_DONE_PREFIX = os.environ.get("QUEUE_DONE_PREFIX", "queue/done")
 
