@@ -1,8 +1,5 @@
 """
-Уведомления по email (SMTP с app password). Помимо исходного письма о
-новых сценах -- добавлены короткие письма о ходе тяжёлой обработки:
-поставлена в очередь / пропущена из-за облачности / готова / упала с
-ошибкой.
+Уведомления по email (SMTP с app password).
 """
 import logging
 import smtplib
@@ -60,11 +57,15 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
 
         if s2_new or l_new:
             zakazy_with_new += 1
+            if new_block:
+                new_block.append("")
             new_block.append(f"Заказ {zakaz}:")
             new_block += [_format_line(p, "S2") for p in s2_new]
             new_block += [_format_line(p, "Landsat") for p in l_new]
 
         if s2_old or l_old:
+            if old_block:
+                old_block.append("")
             old_block.append(f"Заказ {zakaz}:")
             old_block += [_format_line(p, "S2") for p in s2_old]
             old_block += [_format_line(p, "Landsat") for p in l_old]
@@ -81,31 +82,57 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
     _send_email(f"Новые сцены S2/Landsat -- {zakazy_with_new} заказ(ов)", "\n".join(body_parts))
 
 
-def notify_processing_queued(zakaz, date_str, satellite, scenes_count, avg_cloud_percent) -> None:
-    cloud_str = f"{avg_cloud_percent}%" if avg_cloud_percent is not None else "неизвестна (в метаданных нет данных)"
+_STATUS_RU = {"queued": "в очереди на загрузку", "done": "готово", "skipped_cloud": "отбраковано по облачности"}
+
+
+def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decisions: dict) -> None:
+    """Одно сводное письмо за прогон детекции про решения по обработке:
+    что отправлено на загрузку и что отбраковано по облачности ИМЕННО
+    на этом прогоне, плюс (для контекста, как "старые" сцены в письме о
+    новых снимках) -- текущее состояние вообще всех заказов, у которых
+    есть хоть какое-то решение."""
+    if not newly_queued and not newly_skipped:
+        return
+
+    lines = []
+
+    if newly_queued:
+        lines.append("ОТПРАВЛЕНО НА ЗАГРУЗКУ:")
+        lines.append("")
+        for zakaz, satellite, scenes, avg_cloud in newly_queued:
+            cloud_str = f"{avg_cloud}%" if avg_cloud is not None else "неизвестна"
+            lines.append(f"  • Заказ {zakaz} / {satellite}: {scenes} сцен, средняя облачность {cloud_str}")
+        lines.append("")
+
+    if newly_skipped:
+        lines.append("ОТБРАКОВАНО ПО ОБЛАЧНОСТИ:")
+        lines.append("")
+        for zakaz, satellite, avg_cloud in newly_skipped:
+            lines.append(f"  • Заказ {zakaz} / {satellite}: средняя облачность {avg_cloud}% (порог {config.CLOUD_THRESHOLD_PERCENT}%)")
+        lines.append("")
+
+    context_lines = []
+    for zakaz in _sorted_zakazy(all_decisions.keys()):
+        for satellite, info in all_decisions[zakaz].items():
+            status_ru = _STATUS_RU.get(info["status"], info["status"])
+            context_lines.append(f"  • Заказ {zakaz} / {satellite}: {status_ru}")
+
+    if context_lines:
+        lines.append("-" * 40)
+        lines.append("")
+        lines.append("ТЕКУЩЕЕ СОСТОЯНИЕ ВСЕХ ЗАКАЗОВ (для справки):")
+        lines.append("")
+        lines += context_lines
+
+    _send_email("Обработка снимков -- изменения в очереди", "\n".join(lines))
+
+
+def notify_processing_done(zakaz, date_str, satellite, result: dict = None) -> None:
     body = (
         f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\n"
-        f"Собран полный комплект тайлов ({scenes_count} сцен), средняя облачность по метаданным: {cloud_str}.\n"
-        f"Задание поставлено в очередь на обработку (process.py)."
+        f"Обработка завершена -- мозаика, водная маска и 8-бит готовы на Google Drive."
     )
-    _send_email(f"[В очередь] Заказ {zakaz} / {satellite} / {date_str}", body)
-
-
-def notify_processing_skipped_cloud(zakaz, date_str, satellite, avg_cloud_percent) -> None:
-    body = (
-        f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\n"
-        f"Средняя облачность по метаданным сцен составила {avg_cloud_percent}% "
-        f"(порог: {config.CLOUD_THRESHOLD_PERCENT}%).\n"
-        f"Обработка НЕ запущена -- слишком облачно."
-    )
-    _send_email(f"[Пропущено: облачно] Заказ {zakaz} / {satellite} / {date_str}", body)
-
-
-def notify_processing_done(zakaz, date_str, satellite, result: dict) -> None:
-    lines = [f"Заказ {zakaz}, спутник {satellite}, дата {date_str}. Обработка завершена.", ""]
-    for key, value in result.items():
-        lines.append(f"  {key}: {value}")
-    _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
+    _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", body)
 
 
 def notify_processing_failed(zakaz, date_str, satellite, error: str) -> None:
