@@ -2,13 +2,23 @@ name: Keepalive
 
 # GitHub автоматически отключает scheduled-workflow, если в репозитории
 # 60 дней не было НИКАКОЙ активности. Этот workflow раз в неделю делает
-# пустой коммит — чисто чтобы "сбросить таймер" и не дать основному
+# пустой коммит -- чисто чтобы "сбросить таймер" и не дать основному
 # мониторингу молча остановиться.
 
 on:
   schedule:
     - cron: "0 3 * * 1"   # каждый понедельник в 03:00 UTC
   workflow_dispatch: {}
+
+# ВАЖНО: без этого блока GITHUB_TOKEN, который использует job, выдаётся
+# с правами read-only на содержимое репозитория (это дефолт, если в
+# Settings -> Actions -> General -> Workflow permissions не включено
+# "Read and write permissions" вручную). git push тогда падает с
+# "Permission ... denied to github-actions[bot]" / 403. Явное указание
+# permissions здесь работает независимо от настроек репозитория и не
+# требует захода в Settings.
+permissions:
+  contents: write
 
 jobs:
   ping:
