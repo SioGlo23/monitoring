@@ -48,6 +48,18 @@ from providers import copernicus, modis, usgs_m2m
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("s2monitor.monitor")
 
+_REQUIRED_UTILS_FUNCS = (
+    "now_local", "to_local_readable", "retry", "parse_tile_list",
+    "extract_s2_tile", "detect_landsat_number", "utm_crs_for_shape", "compressed_profile",
+)
+_missing_utils = [name for name in _REQUIRED_UTILS_FUNCS if not hasattr(utils, name)]
+if _missing_utils:
+    raise RuntimeError(
+        f"utils.py в репозитории устарел -- отсутствуют функции: {_missing_utils}. "
+        "Скорее всего, при последнем обновлении файл utils.py не был заменён на актуальную "
+        "версию. Скачайте свежий utils.py и замените им файл в корне репозитория."
+    )
+
 
 def _fetch_quicklook(satellite: str, p: dict) -> str:
     """Скачивает квиклук новой сцены и заливает на Drive. Возвращает
