@@ -62,30 +62,33 @@ if _missing_utils:
 
 
 def _fetch_quicklook(satellite: str, p: dict) -> str:
-    """Скачивает квиклук новой сцены и заливает на Drive. Возвращает
+    """Скачивает квиклук новой сцены и заливает на Drive ПУБЛИЧНО (чтобы
+    его можно было встроить как <img> прямо в тултип карты). Возвращает
     ссылку или None -- при любой ошибке просто логирует и не мешает
     остальной детекции (квиклук -- вспомогательная функция)."""
+    local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p.get('Name')}.png")
     try:
         if satellite == "S2":
-            local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p['Name']}.png")
             if not s2_download.download_quicklook(p, local_path):
                 return None
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.png"
-            link = storage.upload_file(local_path, blob_path, content_type="image/png")
+            link = storage.upload_file(local_path, blob_path, content_type="image/png", public=True)
         else:
             url = p.get("quicklook_url")
             if not url:
                 return None
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
+            local_path = local_path.replace(".png", ".jpg")
+            with open(local_path, "wb") as f:
+                f.write(resp.content)
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.jpg"
-            link = storage.upload_bytes(resp.content, blob_path, content_type="image/jpeg")
+            link = storage.upload_file(local_path, blob_path, content_type="image/jpeg", public=True)
         return link
     except Exception as exc:  # noqa: BLE001
         logger.warning("Квиклук для %s (%s) не скачан: %s", p.get("Name"), satellite, exc)
         return None
     finally:
-        local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p.get('Name')}.png")
         if os.path.exists(local_path):
             os.remove(local_path)
 
@@ -291,6 +294,18 @@ def run_once() -> dict:
     if changed_info:
         logger.info("Обнаружены новые сцены: %s", list(changed_info.keys()))
         notifier.notify_new_scenes(current_s2, current_landsat, map_gs_path)
+
+    newly_queued, newly_skipped = [], []
+    for zakaz, sats in decisions_by_zakaz.items():
+        for satellite, info in sats.items():
+            if not info.get("is_new"):
+                continue
+            if info["status"] == "queued":
+                newly_queued.append((zakaz, satellite, info["scenes"], info["avg_cloud"]))
+            elif info["status"] == "skipped_cloud":
+                newly_skipped.append((zakaz, satellite, info["avg_cloud"]))
+    if newly_queued or newly_skipped:
+        notifier.notify_processing_summary(newly_queued, newly_skipped, decisions_by_zakaz)
 
     state_store.save_state(current_s2, current_landsat)
 
