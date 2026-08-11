@@ -81,19 +81,21 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
     _send_email(f"Новые сцены S2/Landsat -- {zakazy_with_new} заказ(ов)", "\n".join(body_parts))
 
 
-def notify_processing_queued(zakaz, date_str, satellite, scenes_count, cloud_percent) -> None:
+def notify_processing_queued(zakaz, date_str, satellite, scenes_count, avg_cloud_percent) -> None:
+    cloud_str = f"{avg_cloud_percent}%" if avg_cloud_percent is not None else "неизвестна (в метаданных нет данных)"
     body = (
         f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\n"
-        f"Собран полный комплект тайлов ({scenes_count} сцен), облачность MODIS: {cloud_percent}%.\n"
+        f"Собран полный комплект тайлов ({scenes_count} сцен), средняя облачность по метаданным: {cloud_str}.\n"
         f"Задание поставлено в очередь на обработку (process.py)."
     )
     _send_email(f"[В очередь] Заказ {zakaz} / {satellite} / {date_str}", body)
 
 
-def notify_processing_skipped_cloud(zakaz, date_str, satellite, cloud_percent) -> None:
+def notify_processing_skipped_cloud(zakaz, date_str, satellite, avg_cloud_percent) -> None:
     body = (
         f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\n"
-        f"Облачность MODIS в AOI составила {cloud_percent}% (порог: {config.CLOUD_THRESHOLD_PERCENT}%).\n"
+        f"Средняя облачность по метаданным сцен составила {avg_cloud_percent}% "
+        f"(порог: {config.CLOUD_THRESHOLD_PERCENT}%).\n"
         f"Обработка НЕ запущена -- слишком облачно."
     )
     _send_email(f"[Пропущено: облачно] Заказ {zakaz} / {satellite} / {date_str}", body)
