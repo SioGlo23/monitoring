@@ -1,0 +1,75 @@
+name: S2 Process
+
+on:
+  schedule:
+    # Реже, чем детекция (каждые 10 мин) -- тяжёлая обработка одной
+    # сцены может занимать больше времени, чем интервал детекции.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      zakaz:
+        description: "Ручной запуск: номер заказа (в обход очереди и порога облачности). Оставьте пустым для обычного прогона очереди."
+        required: false
+        type: string
+      satellite:
+        description: "Ручной запуск: спутник"
+        required: false
+        type: choice
+        options:
+          - ""
+          - "S2"
+          - "L89"
+
+# Отдельная группа concurrency от S2 Monitor -- детекция (monitor.yml)
+# и обработка (этот workflow) не блокируют друг друга и работают
+# параллельно. Внутри себя -- строго последовательно (без параллельных
+# прогонов process.py поверх самого себя).
+concurrency:
+  group: s2-process
+  cancel-in-progress: false
+
+jobs:
+  run-process:
+    runs-on: ubuntu-latest
+    # Максимум, который допускает GitHub для job на стандартном раннере.
+    # Если реальная обработка стабильно упирается в этот лимит --
+    # уменьшите MAX_PARALLEL_AOI/интервал cron либо обрабатывайте
+    # очередь по одному заданию за прогон.
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install GDAL (для gdaladdo / пирамид)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdal-bin
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run processing cycle
+        env:
+          COPERNICUS_USERNAME: ${{ secrets.COPERNICUS_USERNAME }}
+          COPERNICUS_PASSWORD: ${{ secrets.COPERNICUS_PASSWORD }}
+          M2M_USERNAME: ${{ secrets.M2M_USERNAME }}
+          M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
+          M2M_TOKEN: ${{ secrets.M2M_TOKEN }}
+          DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          DRIVE_REFRESH_TOKEN: ${{ secrets.DRIVE_REFRESH_TOKEN }}
+          DRIVE_ROOT_FOLDER_ID: ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          TIMEZONE: "Europe/Moscow"
+          ZAKAZ_OVERRIDE: ${{ github.event.inputs.zakaz }}
+          SATELLITE_OVERRIDE: ${{ github.event.inputs.satellite }}
+        run: python process.py
