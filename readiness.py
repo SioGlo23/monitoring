@@ -11,17 +11,21 @@
   Landsat -- если задан pr_tile -- найдены ВСЕ тайлы из pr_tile;
              если pr_tile не задан/пуст -- ЛЮБЫЕ найденные на AOI
              сцены Landsat, как только их число не меняется
-             config.LANDSAT_STABILITY_CYCLES прогонов подряд (по
-             умолчанию 2, то есть ~20 минут при цикле мониторинга
-             10 минут).
+             config.LANDSAT_STABILITY_CYCLES прогонов подряд.
 
-Гейт по облачности MODIS -- общий на оба спутника для одной AOI+даты:
-  Обработка ставится в очередь ТОЛЬКО если облачность по MODIS уже
-  известна (снимок MODIS скачан и не пуст) И меньше
-  config.CLOUD_THRESHOLD_PERCENT. Если облачность ещё неизвестна --
-  ждём следующих прогонов. Если облачность >= порога -- решение
-  фиксируется как "skipped_cloud" НАВСЕГДА для этой AOI+даты+спутника
-  (MODIS-снимок за прошедшую дату не меняется, повторно не проверяем).
+Гейт по облачности -- считается по метаданным самих сцен (поле
+cloud_cover, которое providers/copernicus.py и providers/usgs_m2m.py
+уже кладут в каждый продукт), а не по MODIS. Если по зоне готово
+несколько сцен одного спутника (например, 2 тайла S2 по mrgs_tiles),
+берётся СРЕДНЕЕ АРИФМЕТИЧЕСКОЕ их облачности. Обработка ставится в
+очередь, если это среднее < config.CLOUD_THRESHOLD_PERCENT. Гейт
+независим для каждого спутника (у S2 и Landsat своя облачность из
+своих же метаданных).
+
+Если ни у одной сцены нет данных об облачности в метаданных (у API
+такое бывает редко, но не исключено) -- решение НЕ блокируется:
+логируется предупреждение, и обработка запускается как обычно, чтобы
+не зависнуть в ожидании данных, которых никогда не появится.
 """
 import logging
 
@@ -55,23 +59,33 @@ def _landsat_ready(feat, landsat_prods, zakaz, date_str) -> bool:
     return count > 0 and stable_cycles >= config.LANDSAT_STABILITY_CYCLES
 
 
-def _enqueue(zakaz, date_str, satellite, products, cloud_percent) -> None:
+def _average_cloud(prods: list):
+    values = [p["cloud_cover"] for p in prods if isinstance(p.get("cloud_cover"), (int, float))]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _enqueue(zakaz, date_str, satellite, products, avg_cloud) -> None:
     job = {
         "zakaz": zakaz,
         "date": date_str,
         "satellite": satellite,
         "products": [{"Name": p.get("Name"), "Id": p.get("Id")} for p in products],
-        "cloud_percent": cloud_percent,
+        "avg_cloud_percent": avg_cloud,
         "created_msk": utils.now_local().strftime("%Y-%m-%d %H:%M:%S"),
     }
     blob_path = f"{config.QUEUE_PENDING_PREFIX}/{zakaz}_{date_str}_{satellite}.json"
     state_store.write_queue_job(blob_path, job)
     state_store.set_processing_decision(zakaz, date_str, satellite, "queued")
-    logger.info("Заказ %s (%s): поставлен в очередь на обработку (%s сцен)", zakaz, satellite, len(products))
-    notifier.notify_processing_queued(zakaz, date_str, satellite, len(products), cloud_percent)
+    logger.info(
+        "Заказ %s (%s): поставлен в очередь на обработку (%s сцен, средняя облачность %s%%)",
+        zakaz, satellite, len(products), avg_cloud,
+    )
+    notifier.notify_processing_queued(zakaz, date_str, satellite, len(products), avg_cloud)
 
 
-def evaluate_and_enqueue(zakaz, feat, date_str, s2_prods, landsat_prods, cloud_percent) -> dict:
+def evaluate_and_enqueue(zakaz, feat, date_str, s2_prods, landsat_prods) -> dict:
     """Возвращает {satellite: decision} для тех спутников, где решение
     было принято/уже есть на этом прогоне -- для лога прогона."""
     decisions = {}
@@ -90,21 +104,23 @@ def evaluate_and_enqueue(zakaz, feat, date_str, s2_prods, landsat_prods, cloud_p
             decisions[satellite] = existing
             continue
 
-        if cloud_percent is None:
-            decisions[satellite] = "waiting_modis"
-            continue
-
-        if cloud_percent >= config.CLOUD_THRESHOLD_PERCENT:
+        avg_cloud = _average_cloud(prods)
+        if avg_cloud is None:
+            logger.warning(
+                "Заказ %s (%s): в метаданных сцен нет данных об облачности -- обрабатываем без гейта",
+                zakaz, satellite,
+            )
+        elif avg_cloud >= config.CLOUD_THRESHOLD_PERCENT:
             state_store.set_processing_decision(zakaz, date_str, satellite, "skipped_cloud")
             decisions[satellite] = "skipped_cloud"
             logger.info(
-                "Заказ %s (%s): пропущена обработка -- облачность MODIS %.1f%% >= порога %.1f%%",
-                zakaz, satellite, cloud_percent, config.CLOUD_THRESHOLD_PERCENT,
+                "Заказ %s (%s): пропущена обработка -- средняя облачность %.1f%% >= порога %.1f%%",
+                zakaz, satellite, avg_cloud, config.CLOUD_THRESHOLD_PERCENT,
             )
-            notifier.notify_processing_skipped_cloud(zakaz, date_str, satellite, cloud_percent)
+            notifier.notify_processing_skipped_cloud(zakaz, date_str, satellite, avg_cloud)
             continue
 
-        _enqueue(zakaz, date_str, satellite, prods, cloud_percent)
+        _enqueue(zakaz, date_str, satellite, prods, avg_cloud)
         decisions[satellite] = "queued"
 
     return decisions
