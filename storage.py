@@ -1,8 +1,3 @@
-"""
-Обёртка над Google Drive API. Заменяет собой Google Cloud Storage --
-все файлы (растры, логи, карты, состояние, очередь заданий) хранятся
-в одной папке на личном Google Drive пользователя, через официальный
-API с OAuth-refresh-токеном.
 
 Все функции работают с "виртуальными путями" вида "logs/2026.../x.json"
 внутри корневой папки DRIVE_ROOT_FOLDER_ID. Папки создаются автоматически
@@ -122,6 +117,16 @@ def download_bytes(blob_path: str) -> bytes:
 
 def download_text(blob_path: str) -> str:
     return download_bytes(blob_path).decode("utf-8")
+
+
+def download_to_file(blob_path: str, local_path: str) -> None:
+    """Скачивает файл с Drive прямо на диск -- используется для
+    восстановления уже готовых промежуточных/финальных артефактов
+    (канал, композит, бандл, мозаика...), чтобы не пересчитывать их
+    заново на каждом прогоне."""
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(download_bytes(blob_path))
 
 
 def download_json(blob_path: str, default=None):
