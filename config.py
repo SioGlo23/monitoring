@@ -37,6 +37,10 @@ GRID_GEOJSON_BLOB = os.environ.get("GRID_GEOJSON_BLOB", "config/GRID_Landsat.geo
 # Подпапки для выходных данных внутри корневой папки на Диске
 MODIS_PREFIX = os.environ.get("MODIS_PREFIX", "modis")
 LOGS_PREFIX = os.environ.get("LOGS_PREFIX", "logs")
+# Логи ТЯЖЁЛОЙ обработки (process.py) -- отдельно от логов мониторинга
+# (detection-циклов), чтобы не смешивались. Формат такой же, как
+# log_operation()/log_history в +S2_L89.ipynb.
+PROCESS_LOGS_PREFIX = os.environ.get("PROCESS_LOGS_PREFIX", "logs_process")
 STATE_BLOB = os.environ.get("STATE_BLOB", "state/previous_state.json")
 
 MOSAICS_PREFIX = os.environ.get("MOSAICS_PREFIX", "Мозаики")
