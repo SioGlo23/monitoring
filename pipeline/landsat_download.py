@@ -3,6 +3,11 @@ Landsat 8/9: авторизация M2M (каталог продуктов дл�
 отдельных каналов) + веб-сессия earthexplorer.usgs.gov (скачивание
 бандла/каналов) + извлечение канала из .tar-бандла. Прямой перенос
 Блока 4б + скачивающей части Блока 7б исходного ноутбука.
+
+Функции здесь намеренно "мелкие" (отдельно бандл, отдельно канал
+напрямую, отдельно извлечение из бандла) -- process.py сам решает,
+какой шаг делать, в зависимости от того, что уже закэшировано на
+Google Drive (см. process.py).
 """
 import logging
 import os
@@ -104,6 +109,7 @@ def _ee_download_by_product_id(session: requests.Session, product_id: str, entit
     if not download_url:
         raise RuntimeError("сервер не вернул прямую ссылку на файл")
 
+    os.makedirs(out_dir, exist_ok=True)
     fp = os.path.join(out_dir, label)
     with session.get(download_url, stream=True, allow_redirects=True, timeout=600) as r:
         r.raise_for_status()
@@ -113,7 +119,46 @@ def _ee_download_by_product_id(session: requests.Session, product_id: str, entit
     return fp
 
 
-def _extract_band_from_bundle(bundle_fp: str, band: str, out_dir: str):
+def download_bundle(ee_session: requests.Session, entity_id: str, sid: str, zip_dir: str) -> str:
+    """Скачивает .tar-бандл сцены в zip_dir/{sid}_bundle.tar. Пробует
+    несколько известных product_id бандла по очереди. Бросает
+    RuntimeError, если ни один вариант не сработал."""
+    os.makedirs(zip_dir, exist_ok=True)
+    bundle_path = os.path.join(zip_dir, f"{sid}_bundle.tar")
+
+    last_error = None
+    for pid in _EE_BUNDLE_PRODUCT_IDS:
+        try:
+            fp = _ee_download_by_product_id(ee_session, pid, entity_id, zip_dir, f"{sid}_bundle_tmp.tar")
+            os.replace(fp, bundle_path)
+            logger.info("Бандл скачан: %s", os.path.basename(bundle_path))
+            return bundle_path
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+    raise RuntimeError(f"Не удалось скачать бандл {sid}: {last_error}")
+
+
+def download_band_direct(ee_session: requests.Session, product_catalog: dict, entity_id: str,
+                          band: str, out_dir: str, sid: str):
+    """Пробует скачать ОДИН канал напрямую (без всего бандла) через
+    каталог продуктов M2M. Возвращает локальный путь или None, если
+    канал недоступен для прямого скачивания (тогда используйте бандл)."""
+    band_num = band.replace("B", "")
+    pid = _find_product_id(product_catalog, [f"band {band_num}"])
+    if not pid:
+        return None
+    try:
+        fp = _ee_download_by_product_id(ee_session, pid, entity_id, out_dir, f"{sid}_{band}.TIF")
+        logger.info("Канал %s скачан отдельно", band)
+        return fp
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Канал %s не удалось скачать отдельно (%s)", band, e)
+        return None
+
+
+def extract_band_from_bundle(bundle_fp: str, band: str, out_dir: str):
+    """Извлекает *_{band}.TIF из уже скачанного .tar-бандла. Возвращает
+    локальный путь или None, если в бандле нет такого канала."""
     try:
         with tarfile.open(bundle_fp, "r:*") as t:
             member = next((m for m in t.getmembers() if m.name.upper().endswith(f"_{band}.TIF")), None)
@@ -122,61 +167,6 @@ def _extract_band_from_bundle(bundle_fp: str, band: str, out_dir: str):
                 return None
             t.extract(member, out_dir)
             return os.path.join(out_dir, member.name)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("Не удалось извлечь %s из бандла: %s", band, e)
         return None
-
-
-def fetch_scene_bands(sid: str, entity_id: str, selected_bands: list, pan_band: str,
-                       ee_session: requests.Session, product_catalog: dict,
-                       zip_dir: str, bands_dir: str) -> dict:
-    """Скачивает бандл (в zip_dir) + недостающие каналы (в bands_dir), при
-    возможности -- отдельными файлами напрямую, иначе извлекает из бандла.
-    Возвращает {band: local_path} для всех selected_bands + pan_band."""
-    os.makedirs(zip_dir, exist_ok=True)
-    os.makedirs(bands_dir, exist_ok=True)
-
-    bundle_path = os.path.join(zip_dir, f"{sid}_bundle.tar")
-    bands_to_fetch = list(selected_bands) + [pan_band]
-    band_paths = {}
-
-    # Пробуем сначала скачать каналы напрямую (без полного бандла) --
-    # быстрее, если продукт-каталог доступен.
-    for band in bands_to_fetch:
-        band_num = band.replace("B", "")
-        pid = _find_product_id(product_catalog, [f"band {band_num}"])
-        if not pid:
-            continue
-        try:
-            fp = _ee_download_by_product_id(ee_session, pid, entity_id, bands_dir, f"{sid}_{band}.TIF")
-            band_paths[band] = fp
-            logger.info("Канал %s скачан отдельно", band)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Канал %s не удалось скачать отдельно (%s) -- попробуем из бандла", band, e)
-
-    missing = [b for b in bands_to_fetch if b not in band_paths]
-    if missing:
-        if not os.path.exists(bundle_path):
-            downloaded, last_error = None, None
-            for pid in _EE_BUNDLE_PRODUCT_IDS:
-                try:
-                    fp = _ee_download_by_product_id(ee_session, pid, entity_id, zip_dir, f"{sid}_bundle_tmp.tar")
-                    os.replace(fp, bundle_path)
-                    downloaded = bundle_path
-                    break
-                except Exception as e:  # noqa: BLE001
-                    last_error = e
-            if not downloaded:
-                raise RuntimeError(f"Не удалось скачать бандл {sid}: {last_error}")
-            logger.info("Бандл скачан: %s", os.path.basename(bundle_path))
-
-        for band in missing:
-            fp = _extract_band_from_bundle(bundle_path, band, bands_dir)
-            if fp:
-                band_paths[band] = fp
-
-    still_missing = [b for b in bands_to_fetch if b not in band_paths]
-    if still_missing:
-        raise RuntimeError(f"Не хватает каналов для {sid}: {still_missing}")
-
-    return band_paths
