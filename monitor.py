@@ -2,26 +2,36 @@
 Один прогон детекции: то, что раньше было одной итерацией while-цикла
 в ноутбуке. GitHub Actions вызывает run_once() каждые 10 минут.
 
-Главное отличие от исходного ноутбука: AOI обрабатываются ПАРАЛЛЕЛЬНО
-(ThreadPoolExecutor). Кроме поиска сцен S2/Landsat и скачивания MODIS,
-на каждом прогоне для каждой AOI также:
-  1. считается облачность MODIS внутри точного полигона AOI;
-  2. проверяется готовность (см. readiness.py) -- собран ли полный
-     ожидаемый комплект тайлов;
-  3. если готово и облачность в норме -- задание на тяжёлую обработку
-     (скачивание/композит/мозаика/вода/8-бит) ставится в очередь на
-     Google Drive, откуда его заберёт отдельный процесс process.py.
+AOI обрабатываются ПАРАЛЛЕЛЬНО (ThreadPoolExecutor). Кроме поиска сцен
+S2/Landsat и скачивания MODIS (для карты), на каждом прогоне для
+каждой AOI также:
+  1. для новых сцен скачивается квиклук (загрубленное превью) и
+     заливается на Google Drive -- для старых сцен ссылка просто
+     переносится из памяти прошлого прогона, повторно не скачивается;
+  2. проверяется готовность (readiness.py) -- собран ли полный
+     ожидаемый комплект тайлов, и укладывается ли средняя облачность
+     по метаданным сцен в порог;
+  3. если готово -- задание на тяжёлую обработку ставится в очередь
+     на Google Drive, откуда его заберёт process.py.
+
+ВАЖНО (устойчивость к сбоям): если обработка конкретной AOI на этом
+прогоне упала с ошибкой -- в state/previous_state.json сохраняются
+данные С ПРОШЛОГО УСПЕШНОГО прогона для этой AOI, а не пустой список.
+Раньше ошибка в одной AOI могла тихо стереть всю накопленную память о
+сценах для неё -- теперь это исключено на двух уровнях (внутри
+_process_one_aoi и ещё раз в run_once на всякий случай).
 
 monitor.py НИКОГДА сам не скачивает каналы и не строит мозаики -- это
 сознательное разделение, чтобы 10-минутный цикл детекции не блокировался
 долгой обработкой (см. process.py и .github/workflows/process.yml).
 """
-import json
 import logging
+import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
+import requests
 from shapely.geometry import shape
 
 import aoi_source
@@ -32,73 +42,121 @@ import readiness
 import state_store
 import storage
 import utils
+from pipeline import s2_download
 from providers import copernicus, modis, usgs_m2m
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("s2monitor.monitor")
 
 
+def _fetch_quicklook(satellite: str, p: dict) -> str:
+    """Скачивает квиклук новой сцены и заливает на Drive. Возвращает
+    ссылку или None -- при любой ошибке просто логирует и не мешает
+    остальной детекции (квиклук -- вспомогательная функция)."""
+    try:
+        if satellite == "S2":
+            local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p['Name']}.png")
+            if not s2_download.download_quicklook(p, local_path):
+                return None
+            blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.png"
+            link = storage.upload_file(local_path, blob_path, content_type="image/png")
+        else:
+            url = p.get("quicklook_url")
+            if not url:
+                return None
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.jpg"
+            link = storage.upload_bytes(resp.content, blob_path, content_type="image/jpeg")
+        return link
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Квиклук для %s (%s) не скачан: %s", p.get("Name"), satellite, exc)
+        return None
+    finally:
+        local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p.get('Name')}.png")
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+def _merge_with_previous(satellite: str, prods: list, previous_prods: list, discovered_readable: str) -> None:
+    """Проставляет discovered_msk/is_new/quicklook_link, сравнивая с
+    предыдущим известным списком, и скачивает квиклуки для НОВЫХ сцен."""
+    for p in prods:
+        old_match = next((o for o in previous_prods if o.get("Id") == p.get("Id")), None)
+        p["discovered_msk"] = old_match["discovered_msk"] if old_match else discovered_readable
+        p["is_new"] = old_match is None
+        if old_match and old_match.get("quicklook_link"):
+            p["quicklook_link"] = old_match["quicklook_link"]
+        elif p["is_new"]:
+            p["quicklook_link"] = _fetch_quicklook(satellite, p)
+        else:
+            p["quicklook_link"] = None
+
+
 def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
                       today_start, tomorrow, monitor_date,
                       previous_s2_for_zakaz, previous_landsat_for_zakaz, discovered_readable):
     """Вся работа по одной AOI. Запускается в отдельном потоке на каждую
-    AOI одновременно."""
-    aoi_shape = shape(feat["geometry"])
-
+    AOI одновременно. При ЛЮБОЙ необработанной ошибке возвращает данные
+    с прошлого прогона как есть (см. docstring модуля) -- никогда не
+    даёт вызывающему коду затереть память о сценах пустотой."""
     try:
-        s2_prods = copernicus.query_for_aoi(zakaz, feat, access_token, today_start, tomorrow)
-    except Exception as exc:  # noqa: BLE001
-        # Не считаем сбой запроса "снимков нет" -- иначе временный
-        # сетевой сбой затёр бы память об уже известных сценах.
-        logger.warning(
-            "Заказ %s: сбой запроса S2 (%s) -- используем данные с прошлого прогона без изменений",
-            zakaz, exc,
-        )
-        s2_prods = [dict(p) for p in previous_s2_for_zakaz]
+        aoi_shape = shape(feat["geometry"])
 
-    old_s2_ids = {p.get("Id") for p in previous_s2_for_zakaz}
-    for p in s2_prods:
-        old_match = next((o for o in previous_s2_for_zakaz if o.get("Id") == p.get("Id")), None)
-        p["discovered_msk"] = old_match["discovered_msk"] if old_match else discovered_readable
-        p["is_new"] = old_match is None
-
-    landsat_prods = []
-    if m2m_session:
         try:
-            landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, monitor_date, grid_gdf)
+            s2_prods = copernicus.query_for_aoi(zakaz, feat, access_token, today_start, tomorrow)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Заказ %s: сбой запроса Landsat (%s) -- используем данные с прошлого прогона без изменений",
+                "Заказ %s: сбой запроса S2 (%s) -- используем данные с прошлого прогона без изменений",
                 zakaz, exc,
             )
-            landsat_prods = [dict(p) for p in previous_landsat_for_zakaz]
+            s2_prods = [dict(p) for p in previous_s2_for_zakaz]
 
+        _merge_with_previous("S2", s2_prods, previous_s2_for_zakaz, discovered_readable)
+
+        landsat_prods = []
+        if m2m_session:
+            try:
+                landsat_prods = usgs_m2m.query_for_aoi(zakaz, feat, m2m_session, monitor_date, grid_gdf)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Заказ %s: сбой запроса Landsat (%s) -- используем данные с прошлого прогона без изменений",
+                    zakaz, exc,
+                )
+                landsat_prods = [dict(p) for p in previous_landsat_for_zakaz]
+            _merge_with_previous("L89", landsat_prods, previous_landsat_for_zakaz, discovered_readable)
+
+        # MODIS -- только для визуального слоя на карте, не влияет на гейтинг.
+        try:
+            modis_path = modis.download_for_aoi(zakaz, aoi_shape, monitor_date)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Заказ %s: сбой скачивания MODIS (%s)", zakaz, exc)
+            modis_path = None
+
+        old_s2_ids = {p.get("Id") for p in previous_s2_for_zakaz}
         old_l_ids = {p.get("Id") for p in previous_landsat_for_zakaz}
-        for p in landsat_prods:
-            old_match = next((o for o in previous_landsat_for_zakaz if o.get("Id") == p.get("Id")), None)
-            p["discovered_msk"] = old_match["discovered_msk"] if old_match else discovered_readable
-            p["is_new"] = old_match is None
+        new_s2_ids = {p.get("Id") for p in s2_prods}
+        new_l_ids = {p.get("Id") for p in landsat_prods}
+        changes = {}
+        if new_s2_ids - old_s2_ids:
+            changes["s2_new"] = list(new_s2_ids - old_s2_ids)
+        if new_l_ids - old_l_ids:
+            changes["landsat_new"] = list(new_l_ids - old_l_ids)
 
-    # MODIS + облачность проверяются на КАЖДОМ прогоне.
-    modis_path, cloud_percent = modis.download_for_aoi(zakaz, aoi_shape, monitor_date)
-    if cloud_percent is not None:
-        state_store.save_cloud_percent(zakaz, monitor_date, cloud_percent)
-    else:
-        cloud_percent = state_store.get_cloud_percent(zakaz, monitor_date)
+        try:
+            processing_decisions = readiness.evaluate_and_enqueue(zakaz, feat, monitor_date, s2_prods, landsat_prods)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Заказ %s: сбой при оценке готовности/постановке в очередь: %s", zakaz, exc)
+            processing_decisions = {}
 
-    new_s2_ids = {p.get("Id") for p in s2_prods}
-    new_l_ids = {p.get("Id") for p in landsat_prods}
-    changes = {}
-    if new_s2_ids - old_s2_ids:
-        changes["s2_new"] = list(new_s2_ids - old_s2_ids)
-    if landsat_prods and (new_l_ids - {p.get("Id") for p in previous_landsat_for_zakaz}):
-        changes["landsat_new"] = list(new_l_ids - {p.get("Id") for p in previous_landsat_for_zakaz})
+        return zakaz, s2_prods, landsat_prods, modis_path, changes, processing_decisions, None
 
-    processing_decisions = readiness.evaluate_and_enqueue(
-        zakaz, feat, monitor_date, s2_prods, landsat_prods, cloud_percent
-    )
-
-    return zakaz, s2_prods, landsat_prods, modis_path, cloud_percent, changes, processing_decisions
+    except Exception as exc:  # noqa: BLE001
+        # Полный неожиданный сбой где-то в теле функции -- отдаём
+        # предыдущие данные как есть, чтобы вызывающий код НИЧЕГО не потерял.
+        logger.error("Заказ %s: НЕОЖИДАННЫЙ сбой обработки AOI: %s", zakaz, exc)
+        logger.error(traceback.format_exc())
+        return zakaz, list(previous_s2_for_zakaz), list(previous_landsat_for_zakaz), None, {}, {}, str(exc)
 
 
 def run_once() -> dict:
@@ -125,7 +183,7 @@ def run_once() -> dict:
     today_start = f"{monitor_date}T00:00:00Z"
     tomorrow = (date_obj + timedelta(days=1)).isoformat() + "T00:00:00Z"
 
-    current_s2, current_landsat, changed_info, modis_status, cloud_by_zakaz, decisions_by_zakaz = (
+    current_s2, current_landsat, changed_info, modis_status, decisions_by_zakaz, aoi_errors = (
         {}, {}, {}, {}, {}, {}
     )
 
@@ -141,18 +199,26 @@ def run_once() -> dict:
         for future in as_completed(futures):
             zakaz = futures[future]
             try:
-                zakaz, s2_prods, landsat_prods, modis_path, cloud_percent, changes, decisions = future.result()
+                zakaz, s2_prods, landsat_prods, modis_path, changes, decisions, error = future.result()
             except Exception as exc:  # noqa: BLE001
-                logger.error("Заказ %s: прогон завершился с ошибкой: %s", zakaz, exc)
-                continue
+                # Такого практически не должно случаться (см. try/except
+                # внутри _process_one_aoi), но на всякий случай тоже не
+                # теряем прошлые данные по этой AOI.
+                logger.error("Заказ %s: future.result() неожиданно упал: %s", zakaz, exc)
+                s2_prods = list(prev_s2.get(str(zakaz), []))
+                landsat_prods = list(prev_landsat.get(str(zakaz), []))
+                modis_path, changes, decisions = None, {}, {}
+                error = str(exc)
+
             current_s2[str(zakaz)] = s2_prods
             current_landsat[str(zakaz)] = landsat_prods
             modis_status[str(zakaz)] = modis_path
-            cloud_by_zakaz[str(zakaz)] = cloud_percent
             if decisions:
                 decisions_by_zakaz[str(zakaz)] = decisions
             if changes:
                 changed_info[str(zakaz)] = changes
+            if error:
+                aoi_errors[str(zakaz)] = error
 
     if m2m_session:
         usgs_m2m.logout(m2m_session)
@@ -167,28 +233,31 @@ def run_once() -> dict:
         "modis_available_count": modis_downloaded_count,
         "modis_total_aoi": len(aoi_dict),
         "changed_info": changed_info,
-        "cloud_percent_by_zakaz": cloud_by_zakaz,
         "processing_decisions": decisions_by_zakaz,
+        "aoi_errors": aoi_errors,
         "zakaz_data": {
             zakaz: {
                 "s2": [
                     {
                         "id": p.get("Id"), "name": p.get("Name"),
+                        "cloud_cover": p.get("cloud_cover"),
                         "start_time_msk": p.get("start_time_msk"), "published_msk": p.get("published_msk"),
                         "discovered_msk": p.get("discovered_msk"), "is_new": p.get("is_new", False),
+                        "quicklook_link": p.get("quicklook_link"),
                     }
                     for p in current_s2.get(zakaz, [])
                 ],
                 "landsat": [
                     {
                         "id": p.get("Id"), "name": p.get("Name"),
+                        "cloud_cover": p.get("cloud_cover"),
                         "start_time_msk": p.get("start_time_msk"),
                         "discovered_msk": p.get("discovered_msk"), "is_new": p.get("is_new", False),
+                        "quicklook_link": p.get("quicklook_link"),
                     }
                     for p in current_landsat.get(zakaz, [])
                 ],
                 "modis_available": bool(modis_status.get(zakaz)),
-                "cloud_percent": cloud_by_zakaz.get(zakaz),
             }
             for zakaz in aoi_dict
         },
@@ -198,7 +267,7 @@ def run_once() -> dict:
     cycle_number = None
     map_gs_path = None
 
-    if changed_info or is_heartbeat:
+    if changed_info or is_heartbeat or aoi_errors:
         cycle_number = state_store.next_cycle_number(cycle_date)
         storage.upload_json(f"{config.LOGS_PREFIX}/{cycle_ts}_{cycle_number:03d}_log.json", log_data)
 
@@ -213,7 +282,9 @@ def run_once() -> dict:
 
     state_store.save_state(current_s2, current_landsat)
 
-    if changed_info:
+    if aoi_errors:
+        status_note = f"ОШИБКИ по AOI: {list(aoi_errors.keys())}, лог #{cycle_number:03d}"
+    elif changed_info:
         status_note = f"новые сцены ({len(changed_info)} заказ(ов)), лог #{cycle_number:03d}"
     elif is_heartbeat:
         status_note = f"новых нет, heartbeat, лог #{cycle_number:03d}"
@@ -234,7 +305,8 @@ def run_once() -> dict:
         "modis_available_count": modis_downloaded_count,
         "new_scenes_found": bool(changed_info),
         "processing_decisions": decisions_by_zakaz,
-        "log_written": bool(changed_info or is_heartbeat),
+        "aoi_errors": aoi_errors,
+        "log_written": bool(changed_info or is_heartbeat or aoi_errors),
     }
     logger.info("=== Прогон детекции завершён: %s ===", result)
     return result
