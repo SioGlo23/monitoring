@@ -7,7 +7,6 @@
   state/stability_counters.json -- счётчик "стабильности" числа найденных
                                     сцен Landsat/S2, когда явный список
                                     ожидаемых тайлов не задан
-  state/cloud_percent.json      -- посчитанная облачность MODIS по AOI+дате
   state/processing_decisions.json -- решения по обработке (queued/done/
                                     skipped_cloud) на каждую AOI+дата+спутник,
                                     чтобы не ставить одно и то же в очередь
@@ -23,7 +22,6 @@ import storage
 CYCLE_COUNTER_BLOB = "state/cycle_counter.json"
 RUN_HISTORY_BLOB = "logs/run_history.log"
 STABILITY_BLOB = "state/stability_counters.json"
-CLOUD_BLOB = "state/cloud_percent.json"
 DECISIONS_BLOB = "state/processing_decisions.json"
 
 
@@ -78,22 +76,6 @@ def update_stability_counter(kind: str, zakaz, date_str: str, current_count: int
     data[key] = {"count": current_count, "stable_cycles": stable_cycles}
     storage.upload_json(STABILITY_BLOB, data)
     return stable_cycles, current_count
-
-
-# ============================== Облачность MODIS ==============================
-
-def get_cloud_percent(zakaz, date_str: str):
-    data = storage.download_json(CLOUD_BLOB, default={})
-    entry = data.get(f"{zakaz}_{date_str}")
-    return entry["percent"] if entry else None
-
-
-def save_cloud_percent(zakaz, date_str: str, percent: float) -> None:
-    import utils
-
-    data = storage.download_json(CLOUD_BLOB, default={})
-    data[f"{zakaz}_{date_str}"] = {"percent": percent, "checked_msk": utils.now_local().strftime("%Y-%m-%d %H:%M:%S")}
-    storage.upload_json(CLOUD_BLOB, data)
 
 
 # ============================== Решения по обработке ==============================
