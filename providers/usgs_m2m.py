@@ -1,7 +1,8 @@
 """
 Landsat 8/9 через USGS M2M API (только поиск сцен). Логика та же, что
 в исходном ноутбуке (поиск + сопоставление с GRID_Landsat), плюс
-опциональная фильтрация по pr_tile.
+опциональная фильтрация по pr_tile, извлечение облачности (уже есть в
+метаданных сцены) и ссылки на превью-изображение (browse/thumbnail).
 """
 import json
 import logging
@@ -68,6 +69,22 @@ def logout(session_id):
         pass
 
 
+def _extract_cloud_cover(scene: dict):
+    raw = scene.get("cloudCover")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_quicklook_url(scene: dict):
+    browse = scene.get("browse") or []
+    if not browse:
+        return None
+    first = browse[0] or {}
+    return first.get("browsePath") or first.get("thumbnailPath")
+
+
 def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: "gpd.GeoDataFrame") -> list:
     if not session_id:
         return []
@@ -98,6 +115,7 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
     results = utils.retry(
         _do_request, attempts=3, delay_seconds=3, logger=logger, what=f"M2M scene-search (заказ {zakaz})"
     )
+    logger.info("Заказ %s: получено от M2M %s сырых сцен", zakaz, len(results))
 
     pr_tiles = utils.parse_tile_list(feat.get("properties", {}).get("pr_tile"))
 
@@ -143,7 +161,8 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
                 "Id": scene.get("entityId") or display_id,
                 "GeoFootprint": geo_fp,
                 "PR": scene_pr,
-                "cloud_cover": scene.get("cloudCover", "N/A"),
+                "cloud_cover": _extract_cloud_cover(scene),
+                "quicklook_url": _extract_quicklook_url(scene),
                 "scene_date": parts[3] if len(parts) > 3 else "Unknown",
                 "start_time_msk": start_time_msk,
             }
