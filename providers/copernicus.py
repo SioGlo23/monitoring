@@ -68,6 +68,7 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
             f"OData.CSC.Intersects(area=geography'SRID=4326;{bbox_wkt}') and "
             f"ContentDate/Start gt {today_start} and ContentDate/Start lt {tomorrow}"
         ),
+        "$expand": "Attributes",
         "$orderby": "ContentDate/Start desc",
         "$top": 20,
     }
@@ -118,4 +119,11 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
         "Заказ %s: после геофильтра %s, после mrgs_tiles-фильтра %s снимков S2",
         zakaz, after_geo, len(filtered),
     )
+    if filtered and all(p.get("cloud_cover") is None for p in filtered):
+        sample_attrs = [a.get("Name") for a in (filtered[0].get("Attributes") or [])]
+        logger.warning(
+            "Заказ %s: ни у одного продукта не нашёлся cloudCover в Attributes. "
+            "Доступные имена атрибутов у первого продукта: %s",
+            zakaz, sample_attrs,
+        )
     return filtered
