@@ -164,11 +164,12 @@ def _run_queue() -> dict:
     return {"jobs_processed": processed, "jobs_failed": failed}
 
 
-def _run_manual(zakaz: str, satellite: str) -> dict:
+def _run_manual(zakaz: str, satellite: str, date_override: str = None) -> dict:
     """Ручной запуск в обход очереди/готовности/облачности -- ищет сцены
-    прямо сейчас и сразу обрабатывает то, что найдётся."""
-    logger.info("=== РУЧНОЙ ЗАПУСК: заказ %s, спутник %s ===", zakaz, satellite)
-    monitor_date = config.MONITOR_DATE
+    на указанную (или сегодняшнюю, если не задана) дату и сразу
+    обрабатывает то, что найдётся."""
+    monitor_date = date_override or config.MONITOR_DATE
+    logger.info("=== РУЧНОЙ ЗАПУСК: заказ %s, спутник %s, дата %s ===", zakaz, satellite, monitor_date)
     aoi_dict = aoi_source.load_aoi_dict()
     feat = aoi_dict.get(str(zakaz))
     if feat is None:
@@ -204,9 +205,10 @@ def _run_manual(zakaz: str, satellite: str) -> dict:
 def run_once() -> dict:
     zakaz_override = (os.environ.get("ZAKAZ_OVERRIDE") or "").strip()
     satellite_override = (os.environ.get("SATELLITE_OVERRIDE") or "").strip()
+    date_override = (os.environ.get("DATE_OVERRIDE") or "").strip() or None
 
     if zakaz_override and satellite_override:
-        return _run_manual(zakaz_override, satellite_override)
+        return _run_manual(zakaz_override, satellite_override, date_override)
 
     return _run_queue()
 
