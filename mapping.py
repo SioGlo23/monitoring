@@ -83,9 +83,18 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             {"type": "FeatureCollection", "features": s2_features},
             name="Sentinel-2 L1C",
             style_function=lambda x: {"color": "#8B00FF", "weight": 2.5, "fillOpacity": 0.25},
+            # При наведении -- лёгкая текстовая подсказка (без картинки, чтобы
+            # не тормозить hover). При КЛИКЕ -- окно с той же информацией плюс
+            # квиклук, которое остаётся открытым, пока не кликнуть в другое
+            # место (в отличие от tooltip, popup не закрывается при уходе курсора).
             tooltip=folium.GeoJsonTooltip(
+                fields=["scene_name", "cloud_cover_label", "start_time_msk"],
+                aliases=["Сцена:", "Облачность:", "Съёмка (МСК):"],
+            ),
+            popup=folium.GeoJsonPopup(
                 fields=["scene_name", "scene_id", "cloud_cover_label", "start_time_msk", "published_msk", "discovered_msk", "quicklook_html"],
                 aliases=["Сцена:", "ID:", "Облачность:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):", "Квиклук:"],
+                max_width=320,
             ),
             show=True,
         ).add_to(m)
@@ -112,8 +121,13 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             name="Landsat 8/9 Level-1",
             style_function=lambda x: {"color": "#FF8C00", "weight": 2.5, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
+                fields=["scene_name", "PR", "cloud_cover_label", "start_time_msk"],
+                aliases=["Сцена:", "PR:", "Облачность:", "Съёмка (МСК):"],
+            ),
+            popup=folium.GeoJsonPopup(
                 fields=["scene_name", "scene_id", "PR", "cloud_cover_label", "start_time_msk", "discovered_msk", "quicklook_html"],
                 aliases=["Сцена:", "ID:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):", "Квиклук:"],
+                max_width=320,
             ),
             show=True,
         ).add_to(m)
