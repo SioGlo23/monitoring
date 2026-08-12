@@ -114,6 +114,16 @@ EIGHTBIT_MINMAX = {
     "L89": {"min_val": 5000, "max_val": 23000},
 }
 
+# Параметры формы водной маски (сглаживание/упрощение контура,
+# минимальная площадь объекта/отверстия) -- единые для обоих спутников.
+# Все "магические числа" пайплайна собраны здесь, в одном файле.
+WATER_SHAPE_PARAMS = {
+    "min_area_m2": float(os.environ.get("WATER_MIN_AREA_M2", "20000")),
+    "min_hole_area_m2": float(os.environ.get("WATER_MIN_HOLE_AREA_M2", "5000")),
+    "smooth_iterations": int(os.environ.get("WATER_SMOOTH_ITERATIONS", "1")),
+    "simplify_factor": float(os.environ.get("WATER_SIMPLIFY_FACTOR", "3.5")),
+}
+
 # Сколько прогонов подряд число найденных сцен должно НЕ меняться,
 # чтобы считать зону "созревшей" -- используется, когда явный список
 # ожидаемых тайлов (mrgs_tiles / pr_tile) не задан.
