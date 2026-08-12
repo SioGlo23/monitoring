@@ -264,7 +264,10 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
     else:
         start = time.time()
         wt = config.WATER_THRESHOLDS[satellite]
-        water.extract_water_mask(mosaic_local_path, water_local_path, wt["porog1"], wt["porog2"], wt["ch1"], wt["ch2"])
+        water.extract_water_mask(
+            mosaic_local_path, water_local_path, wt["porog1"], wt["porog2"], wt["ch1"], wt["ch2"],
+            **config.WATER_SHAPE_PARAMS,
+        )
         storage.upload_file(water_local_path, water_blob, content_type="application/geo+json")
         process_log.log_operation(zakaz, "Выделение воды", water_local_path, time.time() - start, "OK")
 
