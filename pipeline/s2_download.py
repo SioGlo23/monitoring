@@ -193,13 +193,17 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
 
 
 def download_quicklook(prod: dict, out_path: str) -> bool:
-    """Скачивает загрубленное превью (quicklook) сцены. Вместо угадывания
-    фиксированного пути -- парсит manifest.safe (как для каналов) и ищет
-    там файл превью (в href упоминается "preview" и расширение .png/.jpg)
-    -- надёжнее, чем захардкоженный путь, который может отличаться между
-    версиями обработки. Возвращает False (не бросает исключение), если
-    не получилось -- квиклук вспомогательная функция, её отсутствие не
-    должно ронять детекцию."""
+    """Скачивает загрубленное превью (quicklook) сцены. Ищет в
+    manifest.safe ЛЮБОЙ файл, чей href содержит "preview" (без жёсткого
+    требования к расширению -- у части продуктов превью лежит в .jp2,
+    не в .png/.jpg). Если найденный файл не в веб-совместимом формате
+    (png/jpg), скачивает его как есть и конвертирует в PNG через
+    rasterio+Pillow, чтобы картинка реально открывалась в браузере
+    (<img> не умеет показывать JPEG2000).
+
+    Возвращает False (не бросает исключение), если не получилось --
+    квиклук вспомогательная функция, её отсутствие не должно ронять
+    детекцию."""
     prod_name = prod["Name"]
     prod_id = prod["Id"]
     safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
@@ -220,26 +224,85 @@ def download_quicklook(prod: dict, out_path: str) -> bool:
         os.remove(manifest_path)
         return False
 
-    preview_rel_path = None
+    candidates = []
     for elem in root.iter():
         if elem.tag.endswith("fileLocation"):
             href = elem.get("href", "")
-            low = href.lower()
-            if "preview" in low and low.endswith((".png", ".jpg", ".jpeg")):
-                preview_rel_path = href.lstrip("./")
-                break
+            if "preview" in href.lower():
+                candidates.append(href.lstrip("./"))
 
     os.remove(manifest_path)
 
-    if not preview_rel_path:
-        logger.warning("Квиклук %s: в manifest.safe не найден файл превью (preview/*.png|jpg)", prod_name[:40])
+    if not candidates:
+        logger.warning("Квиклук %s: в manifest.safe не найден ни один файл с 'preview' в пути", prod_name[:40])
         return False
 
+    # Предпочитаем уже веб-совместимый формат, если он есть среди найденных.
+    def _priority(href: str) -> int:
+        return 0 if href.lower().endswith((".png", ".jpg", ".jpeg")) else 1
+    candidates.sort(key=_priority)
+    preview_rel_path = candidates[0]
+
     parts = [safe_name] + [s for s in preview_rel_path.split("/") if s]
-    ok = cdse.download_node_file(prod_id, parts, out_path)
-    if not ok:
+    raw_ext = os.path.splitext(preview_rel_path)[1].lower()
+
+    if raw_ext in (".png", ".jpg", ".jpeg"):
+        ok = cdse.download_node_file(prod_id, parts, out_path)
+        if not ok:
+            logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
+        return ok
+
+    # Формат не веб-совместимый (обычно .jp2) -- скачиваем во временный
+    # файл и конвертируем в PNG.
+    tmp_path = out_path + raw_ext
+    if not cdse.download_node_file(prod_id, parts, tmp_path):
         logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
+        return False
+
+    ok = _convert_preview_to_png(tmp_path, out_path)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    if not ok:
+        logger.warning("Квиклук %s: скачан (%s), но не удалось сконвертировать в PNG", prod_name[:40], raw_ext)
     return ok
+
+
+def _convert_preview_to_png(src_path: str, dst_path: str) -> bool:
+    """Конвертирует превью (обычно .jp2) в обычный PNG, который умеет
+    показать <img> в браузере. Простая линейная нормализация в 0..255
+    по 1-99 перцентилям на канал -- превью и так низкого разрешения,
+    сложная цветокоррекция тут не нужна."""
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow не установлен -- конвертация превью в PNG невозможна")
+        return False
+
+    try:
+        with rasterio.open(src_path) as src:
+            data = src.read()
+            if data.dtype != np.uint8:
+                data = data.astype(np.float32)
+                for i in range(data.shape[0]):
+                    band = data[i]
+                    lo, hi = np.percentile(band, [1, 99])
+                    if hi <= lo:
+                        hi = lo + 1.0
+                    data[i] = np.clip((band - lo) / (hi - lo) * 255, 0, 255)
+                data = data.astype(np.uint8)
+
+            if data.shape[0] == 1:
+                img = Image.fromarray(data[0], mode="L")
+            elif data.shape[0] >= 3:
+                img = Image.fromarray(np.moveaxis(data[:3], 0, -1), mode="RGB")
+            else:
+                return False
+
+            img.save(dst_path, format="PNG")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка конвертации превью в PNG: %s", exc)
+        return False
 
 
 def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
@@ -270,21 +333,24 @@ def create_composite_from_bands(bands_path: str, selected_bands: list, output_pa
         band_path = os.path.join(bands_path, f"{band}.jp2")
         with rasterio.open(band_path) as src:
             if src.height == target_h and src.width == target_w:
-                data = src.read(1).astype(np.float32)
+                data = src.read(1)
             else:
-                data = np.empty((target_h, target_w), dtype=np.float32)
+                # Ресемплируем в исходном uint16 -- GDAL/rasterio сами
+                # корректно округляют при билинейной интерполяции целых
+                # значений, промежуточный float32-буфер не нужен.
+                data = np.zeros((target_h, target_w), dtype=np.uint16)
                 reproject(
                     source=rasterio.band(src, 1), destination=data,
                     src_transform=src.transform, src_crs=src.crs,
                     dst_transform=target_transform, dst_crs=target_crs,
                     resampling=Resampling.bilinear,
                 )
-            bands_data.append(data)
+            bands_data.append(data.astype(np.uint16))
 
     composite_array = np.stack(bands_data, axis=0)
     out_meta = {
         "driver": "GTiff", "height": target_h, "width": target_w,
-        "count": len(bands_data), "dtype": "float32",
+        "count": len(bands_data), "dtype": "uint16",
         "crs": target_crs, "transform": target_transform,
         "compress": "ZSTD", "predictor": 2, "tiled": True,
         "blockxsize": 256, "blockysize": 256, "nodata": 0,
