@@ -108,6 +108,43 @@ def _merge_with_previous(satellite: str, prods: list, previous_prods: list, disc
             p["quicklook_link"] = None
 
 
+def _trigger_process_workflow() -> None:
+    """Запускает workflow 'S2 Process' немедленно через GitHub REST API
+    (workflow_dispatch), вместо того чтобы ждать его собственного
+    расписания. GITHUB_TOKEN и GITHUB_REPOSITORY уже доступны в
+    окружении любого шага GitHub Actions -- токену только нужно право
+    actions:write (см. permissions в .github/workflows/monitor.yml).
+    Если по какой-то причине запустить не получилось -- не страшно,
+    собственное расписание process.yml всё равно рано или поздно
+    заберёт задание из очереди."""
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        logger.warning(
+            "GITHUB_TOKEN/GITHUB_REPOSITORY недоступны -- не могу запустить S2 Process немедленно "
+            "(заберётся по расписанию process.yml)"
+        )
+        return
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/process.yml/dispatches"
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json={"ref": os.environ.get("GITHUB_REF_NAME", "main")},
+            timeout=15,
+        )
+        if resp.status_code == 204:
+            logger.info("S2 Process запущен немедленно (триггер из мониторинга)")
+        else:
+            logger.warning(
+                "Не удалось запустить S2 Process немедленно (HTTP %s): %s -- заберётся по расписанию",
+                resp.status_code, resp.text[:300],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка при попытке немедленного запуска S2 Process: %s -- заберётся по расписанию", exc)
+
+
 def _process_one_aoi(zakaz, feat, access_token, m2m_session, grid_gdf,
                       today_start, tomorrow, monitor_date,
                       previous_s2_for_zakaz, previous_landsat_for_zakaz, discovered_readable):
@@ -306,6 +343,9 @@ def run_once() -> dict:
                 newly_skipped.append((zakaz, satellite, info["avg_cloud"]))
     if newly_queued or newly_skipped:
         notifier.notify_processing_summary(newly_queued, newly_skipped, decisions_by_zakaz)
+
+    if newly_queued:
+        _trigger_process_workflow()
 
     state_store.save_state(current_s2, current_landsat)
 
