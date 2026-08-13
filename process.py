@@ -1,6 +1,6 @@
 """
-Тяжёлая обработка: скачивание каналов -> композит -> мозаика -> вода
--> 8-бит. Работает НЕЗАВИСИМО от monitor.py (отдельный workflow,
+Тяжёлая обработка: скачивание каналов -> композит -> мозаика -> пирамиды
+-> 8-бит -> вода. Работает НЕЗАВИСИМО от monitor.py (отдельный workflow,
 отдельное расписание) и забирает готовые задания из очереди на Google
 Drive (queue/pending/), которые туда кладёт readiness.py по итогам
 детекции в monitor.py.
@@ -256,21 +256,6 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
                 storage.upload_file(ovr_local, ovr_blob, content_type="application/octet-stream")
             process_log.log_operation(zakaz, "Создание пирамид", mosaic_local_path, time.time() - start, "OK")
 
-    water_blob = f"{config.WATER_PREFIX}/{final_name}_water.geojson"
-    water_local_path = os.path.join(mosaics_dir, "water", f"{final_name}_water.geojson")
-    if storage.blob_exists(water_blob):
-        logger.info("Водная маска %s уже есть на Drive -- пропускаю пересборку", final_name)
-        process_log.log_operation(zakaz, "Выделение воды (уже существует)", None, 0.0, "OK")
-    else:
-        start = time.time()
-        wt = config.WATER_THRESHOLDS[satellite]
-        water.extract_water_mask(
-            mosaic_local_path, water_local_path, wt["porog1"], wt["porog2"], wt["ch1"], wt["ch2"],
-            **config.WATER_SHAPE_PARAMS,
-        )
-        storage.upload_file(water_local_path, water_blob, content_type="application/geo+json")
-        process_log.log_operation(zakaz, "Выделение воды", water_local_path, time.time() - start, "OK")
-
     eb_zstd_blob = f"{config.EIGHTBIT_PREFIX}/{final_name}_8bit_ZSTD.tif"
     eb_jpeg_blob = f"{config.EIGHTBIT_PREFIX}/{final_name}_8bit_JPEG.tif"
     if storage.blob_exists(eb_zstd_blob) and storage.blob_exists(eb_jpeg_blob):
@@ -286,6 +271,21 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
             storage.upload_file(eb_path, f"{config.EIGHTBIT_PREFIX}/{eb_name}", content_type="image/tiff")
             kind = "ZSTD" if "ZSTD" in eb_name else "JPEG"
             process_log.log_operation(zakaz, f"Конвертация в 8-бит ({kind})", eb_path, duration, "OK")
+
+    water_blob = f"{config.WATER_PREFIX}/{final_name}_water.geojson"
+    water_local_path = os.path.join(mosaics_dir, "water", f"{final_name}_water.geojson")
+    if storage.blob_exists(water_blob):
+        logger.info("Водная маска %s уже есть на Drive -- пропускаю пересборку", final_name)
+        process_log.log_operation(zakaz, "Выделение воды (уже существует)", None, 0.0, "OK")
+    else:
+        start = time.time()
+        wt = config.WATER_THRESHOLDS[satellite]
+        water.extract_water_mask(
+            mosaic_local_path, water_local_path, wt["porog1"], wt["porog2"], wt["ch1"], wt["ch2"],
+            **config.WATER_SHAPE_PARAMS,
+        )
+        storage.upload_file(water_local_path, water_blob, content_type="application/geo+json")
+        process_log.log_operation(zakaz, "Выделение воды", water_local_path, time.time() - start, "OK")
 
     result_links = {
         "mosaic": f"drive:{mosaic_blob}",
