@@ -1,172 +1,364 @@
 """
-Выделение водных объектов -- прямой перенос Блока 9 исходного
-ноутбука. Пороги (porog1/porog2/ch1/ch2) подаются вызывающим кодом
-(process.py берёт их из config.WATER_THRESHOLDS по спутнику).
+Sentinel-2: поканальное скачивание (parsing manifest.safe -> точные
+пути -> Nodes()/$value) + сборка композита из отдельных {band}.jp2.
+Прямой перенос Блоков 6+7а исходного ноутбука, адаптированный на
+локальные пути (без монтирования Google Drive).
 """
 import logging
 import os
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
-import geopandas as gpd
 import numpy as np
 import rasterio
-import rasterio.features
-from shapely.geometry import MultiPolygon, Polygon, mapping, shape
+import requests
+from rasterio.warp import Resampling, reproject
 
-try:
-    from skimage.morphology import remove_small_holes
-except ImportError:  # pragma: no cover
-    import subprocess
-    import sys
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "scikit-image"], check=True)
-    from skimage.morphology import remove_small_holes
+from providers import copernicus
 
-logger = logging.getLogger("s2monitor.pipeline.water")
+logger = logging.getLogger("s2monitor.pipeline.s2_download")
+
+_CDSE_ODATA = "https://download.dataspace.copernicus.eu/odata/v1"
+_TOKEN_TTL = 540
+_HTTP_RETRIES = 4
 
 
-def _pixel_area_m2(src) -> float:
-    px_w = abs(src.transform.a)
-    px_h = abs(src.transform.e)
-    if src.crs and src.crs.is_geographic:
-        lat = (src.bounds.top + src.bounds.bottom) / 2
-        m_per_deg_lat = 111320.0
-        m_per_deg_lon = 111320.0 * np.cos(np.radians(lat))
-        return (px_w * m_per_deg_lon) * (px_h * m_per_deg_lat)
-    return px_w * px_h
+class _CdseSession:
+    """Обёртка над requests.Session с автообновлением токена CDSE и
+    повторами на 401/429/5xx -- нужна на время долгого поканального
+    скачивания одной сцены (обычный get_access_token() тут не годится,
+    т.к. токен CDSE живёт ~10 минут, а скачивание может занять дольше)."""
 
+    def __init__(self):
+        self.session = requests.Session()
+        self._token = None
+        self._token_ts = 0.0
+        self._node_style_quoted = None
 
-def _remove_small_holes_vector(geom, min_hole_area_m2: float):
-    if geom.is_empty:
-        return geom
-    if geom.geom_type == "Polygon":
-        polys = [geom]
-    elif geom.geom_type == "MultiPolygon":
-        polys = list(geom.geoms)
-    else:
-        return geom
+    def _get_valid_token(self, force: bool = False) -> str:
+        now = time.time()
+        if force or not self._token or (now - self._token_ts) > _TOKEN_TTL:
+            self._token = copernicus.get_access_token()
+            self._token_ts = now
+        return self._token
 
-    cleaned = []
-    for poly in polys:
-        kept_interiors = [ring for ring in poly.interiors if Polygon(ring).area >= min_hole_area_m2]
-        cleaned.append(Polygon(poly.exterior.coords, [list(r.coords) for r in kept_interiors]))
+    def _auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._get_valid_token()}"}
 
-    result = cleaned[0] if len(cleaned) == 1 else MultiPolygon(cleaned)
-    return result if result.is_valid else result.buffer(0)
-
-
-def _chaikin_smooth_ring(coords, iterations: int = 3):
-    pts = list(coords)
-    if len(pts) >= 2 and pts[0] == pts[-1]:
-        pts = pts[:-1]
-    if len(pts) < 3:
-        return coords
-
-    for _ in range(iterations):
-        new_pts = []
-        n = len(pts)
-        for i in range(n):
-            p0, p1 = pts[i], pts[(i + 1) % n]
-            q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
-            r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
-            new_pts.extend([q, r])
-        pts = new_pts
-
-    pts.append(pts[0])
-    return pts
-
-
-def _smooth_geom(geom, simplify_tolerance_m: float, iterations: int = 3):
-    if geom.is_empty:
-        return geom
-
-    def _smooth_polygon(poly):
-        simplified = poly.simplify(simplify_tolerance_m, preserve_topology=True)
-        if simplified.is_empty or simplified.geom_type != "Polygon":
-            simplified = poly
-        ext = _chaikin_smooth_ring(list(simplified.exterior.coords), iterations)
-        ints = [_chaikin_smooth_ring(list(r.coords), iterations) for r in simplified.interiors]
-        try:
-            new_poly = Polygon(ext, ints)
-            return new_poly if new_poly.is_valid else new_poly.buffer(0)
-        except Exception:
-            return poly
-
-    if geom.geom_type == "Polygon":
-        return _smooth_polygon(geom)
-    elif geom.geom_type == "MultiPolygon":
-        smoothed = [_smooth_polygon(p) for p in geom.geoms if not p.is_empty]
-        smoothed = [g for g in smoothed if not g.is_empty]
-        if not smoothed:
-            return geom
-        return smoothed[0] if len(smoothed) == 1 else MultiPolygon(smoothed)
-    return geom
-
-
-def extract_water_mask(raster_path: str, output_geojson_path: str, porog1: int, porog2: int, ch1: int, ch2: int,
-                        min_area_m2: float = 20000, min_hole_area_m2: float = 5000,
-                        smooth_iterations: int = 1, simplify_factor: float = 3.5) -> str:
-    logger.info(
-        "Выделяем водную поверхность: %s (пороги: %s/%s, каналы: %s/%s)",
-        os.path.basename(raster_path), porog1, porog2, ch1, ch2,
-    )
-
-    with rasterio.open(raster_path) as src:
-        data = src.read()  # все каналы разом -- (count, H, W)
-        band1 = data[ch1 - 1]
-        band2 = data[ch2 - 1]
-        crs = src.crs
-        transform = src.transform
-
-        # Пиксель считается валидным, только если ВО ВСЕХ каналах
-        # композита значение > 0 (не nodata/не чёрный) -- иначе краевые
-        # артефакты паншарпа/ресемплинга могли бы ложно попасть в воду.
-        valid_mask = np.all(data > 0, axis=0)
-
-        water_bool = valid_mask & (band1 > 1) & (band1 < porog1) & (band2 < porog2)
-
-        pixel_area = _pixel_area_m2(src)
-        pixel_size = pixel_area ** 0.5
-        simplify_tolerance_m = simplify_factor * pixel_size
-
-        min_hole_px = max(1, int(round(min_hole_area_m2 / pixel_area)))
-        water_bool = remove_small_holes(water_bool, area_threshold=min_hole_px)
-
-        water_mask = water_bool.astype("uint8")
-        shapes_iter = list(rasterio.features.shapes(water_mask, mask=water_mask > 0, transform=transform))
-
-        features = []
-        for geom_dict, _value in shapes_iter:
-            geom = shape(geom_dict)
-            geom_gdf = gpd.GeoDataFrame(geometry=[geom], crs=crs)
-            geom_metric = geom_gdf.to_crs("EPSG:3857").geometry.iloc[0]
-
-            if geom_metric.area <= min_area_m2:
+    def _http_get(self, url: str, stream: bool = False, timeout=(30, 900)):
+        for attempt in range(1, _HTTP_RETRIES + 1):
+            try:
+                r = self.session.get(url, headers=self._auth_headers(), stream=stream, timeout=timeout)
+            except requests.RequestException as e:
+                logger.warning("Сетевая ошибка (%s/%s): %s", attempt, _HTTP_RETRIES, e)
+                time.sleep(3 * attempt)
                 continue
 
-            geom_metric = _remove_small_holes_vector(geom_metric, min_hole_area_m2)
-            if geom_metric.is_empty:
+            if r.status_code == 401:
+                r.close()
+                self._get_valid_token(force=True)
                 continue
-
-            geom_metric = _smooth_geom(geom_metric, simplify_tolerance_m, smooth_iterations)
-            if geom_metric.is_empty:
+            if r.status_code in (429, 500, 502, 503, 504):
+                r.close()
+                wait = 5 * attempt
+                logger.warning("HTTP %s, повтор через %s с (%s/%s)", r.status_code, wait, attempt, _HTTP_RETRIES)
+                time.sleep(wait)
                 continue
+            return r
+        return None
 
-            geom_out = gpd.GeoSeries([geom_metric], crs="EPSG:3857").to_crs(crs).iloc[0]
+    def _build_node_url(self, prod_id: str, parts, quoted: bool) -> str:
+        url = f"{_CDSE_ODATA}/Products({prod_id})"
+        for p in parts:
+            name = quote(str(p), safe="._-")
+            url += f"/Nodes('{name}')" if quoted else f"/Nodes({name})"
+        return url
 
-            features.append({
-                "type": "Feature",
-                "geometry": mapping(geom_out),
-                "properties": {"obj_type": "water", "area_m2": round(geom_metric.area, 2)},
-            })
+    def node_value_url(self, prod_id: str, parts) -> str:
+        st = self._node_style_quoted if self._node_style_quoted is not None else False
+        return self._build_node_url(prod_id, parts, quoted=st) + "/$value"
 
-        geojson_data = {
-            "type": "FeatureCollection",
-            "crs": {"type": "name", "properties": {"name": str(crs)}},
-            "features": features,
-        }
-        os.makedirs(os.path.dirname(output_geojson_path), exist_ok=True)
-        import json
-        with open(output_geojson_path, "w", encoding="utf-8") as f:
-            json.dump(geojson_data, f, ensure_ascii=False, indent=2)
+    def probe_node_style(self, prod_id: str, parts) -> None:
+        """Определяет, нужны ли кавычки вокруг имени узла в URL -- CDSE
+        принимает оба стиля в зависимости от коллекции, поэтому пробуем
+        оба на первом запросе и запоминаем рабочий."""
+        for st in (False, True):
+            url = self._build_node_url(prod_id, parts, quoted=st) + "/Nodes"
+            r = self._http_get(url)
+            if r is not None and r.status_code == 200:
+                self._node_style_quoted = st
+                r.close()
+                return
+            if r is not None:
+                r.close()
 
-    logger.info("Водная маска сохранена (%s объектов)", len(features))
-    return output_geojson_path
+    def download_node_file(self, prod_id: str, parts, dst: str, expected_size: int = 0) -> bool:
+        tmp = dst + ".part"
+        url = self.node_value_url(prod_id, parts)
+
+        for attempt in range(1, _HTTP_RETRIES + 1):
+            r = self._http_get(url, stream=True)
+            if r is None:
+                break
+            if r.status_code != 200:
+                logger.error("HTTP %s для %s", r.status_code, os.path.basename(dst))
+                r.close()
+                break
+            try:
+                with r, open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+                size = os.path.getsize(tmp)
+                if expected_size and abs(size - expected_size) > 1024:
+                    raise IOError(f"размер {size} != ожидаемого {expected_size}")
+                if dst.lower().endswith(".jp2") and not _is_valid_jp2(tmp):
+                    raise IOError("файл не похож на JP2 (битая загрузка)")
+
+                os.replace(tmp, dst)
+                logger.info("Скачано %s (%.1f МБ)", os.path.basename(dst), size / (1024 * 1024))
+                return True
+            except Exception as e:
+                logger.warning("Ошибка загрузки (%s/%s): %s", attempt, _HTTP_RETRIES, e)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                time.sleep(3 * attempt)
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
+def _is_valid_jp2(path: str) -> bool:
+    try:
+        if os.path.getsize(path) < 1024:
+            return False
+        with open(path, "rb") as f:
+            sig = f.read(12)
+        return sig.startswith(b"\x00\x00\x00\x0cjP") or sig.startswith(b"\xff\x4f\xff\x51")
+    except Exception:
+        return False
+
+
+def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> str:
+    """Скачивает только нужные каналы Sentinel-2 через parsing manifest.safe.
+    Каналы сохраняются под каноническим именем {band}.jp2 в out_dir."""
+    prod_name = prod["Name"]
+    prod_id = prod["Id"]
+    safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
+
+    os.makedirs(out_dir, exist_ok=True)
+    cdse = _CdseSession()
+
+    manifest_path = os.path.join(out_dir, "manifest.safe")
+    logger.info("Читаю manifest.safe для %s...", prod_name[:40])
+    cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
+    if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
+        raise RuntimeError(f"Не удалось скачать manifest.safe для {prod_name}")
+
+    root = ET.parse(manifest_path).getroot()
+
+    band_paths = {}
+    for elem in root.iter():
+        if elem.tag.endswith("fileLocation"):
+            href = elem.get("href", "")
+            for band in selected_bands:
+                if f"_{band}.jp2" in href and band not in band_paths:
+                    band_paths[band] = href.lstrip("./")
+
+    if not band_paths:
+        raise RuntimeError(f"В manifest.safe не найдены каналы: {selected_bands}")
+
+    downloaded = []
+    for band, rel_path in band_paths.items():
+        local_path = os.path.join(out_dir, f"{band}.jp2")
+        if _is_valid_jp2(local_path):
+            downloaded.append(local_path)
+            continue
+
+        parts = [safe_name] + [s for s in rel_path.split("/") if s]
+        if cdse.download_node_file(prod_id, parts, local_path):
+            downloaded.append(local_path)
+        else:
+            logger.error("Не удалось скачать канал %s для %s", band, prod_name)
+
+    if not downloaded:
+        raise RuntimeError(f"Ни один канал не скачан для {prod_name}")
+    if len(downloaded) < len(selected_bands):
+        logger.warning("Скачано %s/%s каналов для %s -- продолжаем с тем, что есть", len(downloaded), len(selected_bands), prod_name)
+
+    return out_dir
+
+
+def download_quicklook(prod: dict, out_path: str) -> bool:
+    """Скачивает загрубленное превью (quicklook) сцены. Ищет в
+    manifest.safe ЛЮБОЙ файл, чей href содержит "preview" (без жёсткого
+    требования к расширению -- у части продуктов превью лежит в .jp2,
+    не в .png/.jpg). Если найденный файл не в веб-совместимом формате
+    (png/jpg), скачивает его как есть и конвертирует в PNG через
+    rasterio+Pillow, чтобы картинка реально открывалась в браузере
+    (<img> не умеет показывать JPEG2000).
+
+    Возвращает False (не бросает исключение), если не получилось --
+    квиклук вспомогательная функция, её отсутствие не должно ронять
+    детекцию."""
+    prod_name = prod["Name"]
+    prod_id = prod["Id"]
+    safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cdse = _CdseSession()
+
+    manifest_path = out_path + ".manifest.safe"
+    cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
+    if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
+        logger.warning("Квиклук %s: не удалось скачать manifest.safe", prod_name[:40])
+        return False
+
+    try:
+        root = ET.parse(manifest_path).getroot()
+    except ET.ParseError as e:
+        logger.warning("Квиклук %s: ошибка парсинга manifest.safe: %s", prod_name[:40], e)
+        os.remove(manifest_path)
+        return False
+
+    candidates = []
+    for elem in root.iter():
+        if elem.tag.endswith("fileLocation"):
+            href = elem.get("href", "")
+            if "preview" in href.lower():
+                candidates.append(href.lstrip("./"))
+
+    os.remove(manifest_path)
+
+    if not candidates:
+        logger.warning("Квиклук %s: в manifest.safe не найден ни один файл с 'preview' в пути", prod_name[:40])
+        return False
+
+    # Предпочитаем уже веб-совместимый формат, если он есть среди найденных.
+    def _priority(href: str) -> int:
+        return 0 if href.lower().endswith((".png", ".jpg", ".jpeg")) else 1
+    candidates.sort(key=_priority)
+    preview_rel_path = candidates[0]
+
+    parts = [safe_name] + [s for s in preview_rel_path.split("/") if s]
+    raw_ext = os.path.splitext(preview_rel_path)[1].lower()
+
+    if raw_ext in (".png", ".jpg", ".jpeg"):
+        ok = cdse.download_node_file(prod_id, parts, out_path)
+        if not ok:
+            logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
+        return ok
+
+    # Формат не веб-совместимый (обычно .jp2) -- скачиваем во временный
+    # файл и конвертируем в PNG.
+    tmp_path = out_path + raw_ext
+    if not cdse.download_node_file(prod_id, parts, tmp_path):
+        logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
+        return False
+
+    ok = _convert_preview_to_png(tmp_path, out_path)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    if not ok:
+        logger.warning("Квиклук %s: скачан (%s), но не удалось сконвертировать в PNG", prod_name[:40], raw_ext)
+    return ok
+
+
+def _convert_preview_to_png(src_path: str, dst_path: str) -> bool:
+    """Конвертирует превью (обычно .jp2) в обычный PNG, который умеет
+    показать <img> в браузере. Простая линейная нормализация в 0..255
+    по 1-99 перцентилям на канал -- превью и так низкого разрешения,
+    сложная цветокоррекция тут не нужна."""
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow не установлен -- конвертация превью в PNG невозможна")
+        return False
+
+    try:
+        with rasterio.open(src_path) as src:
+            data = src.read()
+            if data.dtype != np.uint8:
+                data = data.astype(np.float32)
+                for i in range(data.shape[0]):
+                    band = data[i]
+                    lo, hi = np.percentile(band, [1, 99])
+                    if hi <= lo:
+                        hi = lo + 1.0
+                    data[i] = np.clip((band - lo) / (hi - lo) * 255, 0, 255)
+                data = data.astype(np.uint8)
+
+            if data.shape[0] == 1:
+                img = Image.fromarray(data[0], mode="L")
+            elif data.shape[0] >= 3:
+                img = Image.fromarray(np.moveaxis(data[:3], 0, -1), mode="RGB")
+            else:
+                return False
+
+            img.save(dst_path, format="PNG")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка конвертации превью в PNG: %s", exc)
+        return False
+
+
+def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
+    """Создаёт многоканальный GeoTIFF из отдельных {band}.jp2. Эталон
+    разрешения -- канал с САМЫМ ВЫСОКИМ разрешением, остальные
+    ресемплируются под его сетку."""
+    band_infos = {}
+    for band in selected_bands:
+        band_path = os.path.join(bands_path, f"{band}.jp2")
+        if not os.path.exists(band_path):
+            logger.warning("Пропущен отсутствующий канал: %s", band)
+            continue
+        with rasterio.open(band_path) as src:
+            band_infos[band] = {"width": src.width, "height": src.height, "crs": src.crs, "transform": src.transform}
+
+    if not band_infos:
+        raise RuntimeError("Нет данных для композита")
+
+    ref_band = max(band_infos, key=lambda b: band_infos[b]["width"])
+    ref = band_infos[ref_band]
+    target_crs, target_transform = ref["crs"], ref["transform"]
+    target_h, target_w = ref["height"], ref["width"]
+
+    bands_data = []
+    for band in selected_bands:
+        if band not in band_infos:
+            continue
+        band_path = os.path.join(bands_path, f"{band}.jp2")
+        with rasterio.open(band_path) as src:
+            if src.height == target_h and src.width == target_w:
+                data = src.read(1)
+            else:
+                # Ресемплируем в исходном uint16 -- GDAL/rasterio сами
+                # корректно округляют при билинейной интерполяции целых
+                # значений, промежуточный float32-буфер не нужен.
+                data = np.zeros((target_h, target_w), dtype=np.uint16)
+                reproject(
+                    source=rasterio.band(src, 1), destination=data,
+                    src_transform=src.transform, src_crs=src.crs,
+                    dst_transform=target_transform, dst_crs=target_crs,
+                    resampling=Resampling.bilinear,
+                )
+            bands_data.append(data.astype(np.uint16))
+
+    composite_array = np.stack(bands_data, axis=0)
+    out_meta = {
+        "driver": "GTiff", "height": target_h, "width": target_w,
+        "count": len(bands_data), "dtype": "uint16",
+        "crs": target_crs, "transform": target_transform,
+        "compress": "ZSTD", "predictor": 2, "tiled": True,
+        "blockxsize": 256, "blockysize": 256, "nodata": 0,
+    }
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with rasterio.open(output_path, "w", **out_meta) as dst:
+        dst.write(composite_array)
+
+    logger.info("Композит собран: %s", os.path.basename(output_path))
+    return output_path
