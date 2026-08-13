@@ -3,7 +3,10 @@ name: S2 Process
 on:
   schedule:
     # Реже, чем детекция (каждые 10 мин) -- тяжёлая обработка одной
-    # сцены может занимать больше времени, чем интервал детекции.
+    # сцены может занимать больше времени, чем интервал детекции. Плюс
+    # monitor.py теперь запускает этот workflow немедленно сам, как
+    # только появляется задание -- расписание тут просто подстраховка
+    # на случай сбоя мгновенного триггера.
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
@@ -23,6 +26,16 @@ on:
         description: "Ручной запуск: дата снимков в формате ГГГГ-ММ-ДД (необязательно -- если не указать, берётся сегодняшняя)"
         required: false
         type: string
+      channels:
+        description: "Ручной запуск: набор каналов (пусто = SWIRNR по умолчанию)"
+        required: false
+        type: choice
+        options:
+          - ""
+          - "SWIRNR"
+          - "RGB"
+          - "RGBN"
+          - "RGBNSWIR"
 
 # Отдельная группа concurrency от S2 Monitor -- детекция (monitor.yml)
 # и обработка (этот workflow) не блокируют друг друга и работают
@@ -77,4 +90,10 @@ jobs:
           ZAKAZ_OVERRIDE: ${{ github.event.inputs.zakaz }}
           SATELLITE_OVERRIDE: ${{ github.event.inputs.satellite }}
           DATE_OVERRIDE: ${{ github.event.inputs.date }}
+          # Пустой выбор в workflow_dispatch -> "" -> это falsy в GitHub
+          # Actions expressions, поэтому "||" корректно откатывается на
+          # SWIRNR по умолчанию. При обычном (не ручном) запуске по
+          # расписанию github.event.inputs.channels вообще не существует
+          # (это не workflow_dispatch), поэтому тоже используется SWIRNR.
+          CHANNELS: ${{ github.event.inputs.channels || 'SWIRNR' }}
         run: python process.py
