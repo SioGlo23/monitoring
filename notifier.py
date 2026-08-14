@@ -82,7 +82,23 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
     _send_email(f"Новые сцены S2/Landsat -- {zakazy_with_new} заказ(ов)", "\n".join(body_parts))
 
 
-_STATUS_RU = {"queued": "в очереди на загрузку", "done": "готово", "skipped_cloud": "отбраковано по облачности"}
+_STATUS_RU = {
+    "queued": "в очереди на загрузку",
+    "done": "готово",
+    "skipped_cloud": "отбраковано по облачности",
+    "failed": "ошибка обработки",
+}
+
+
+def _status_lines(all_decisions: dict) -> list:
+    """all_decisions: {zakaz: {satellite: status_string}} -> строки вида
+    '  • Заказ N / SPUTNIK: статус' для раздела "текущее состояние"."""
+    lines = []
+    for zakaz in _sorted_zakazy(all_decisions.keys()):
+        for satellite, status in all_decisions[zakaz].items():
+            status_ru = _STATUS_RU.get(status, status)
+            lines.append(f"  • Заказ {zakaz} / {satellite}: {status_ru}")
+    return lines
 
 
 def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decisions: dict) -> None:
@@ -90,7 +106,7 @@ def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decis
     что отправлено на загрузку и что отбраковано по облачности ИМЕННО
     на этом прогоне, плюс (для контекста, как "старые" сцены в письме о
     новых снимках) -- текущее состояние вообще всех заказов, у которых
-    есть хоть какое-то решение."""
+    есть хоть какое-то решение. all_decisions: {zakaz: {satellite: status}}."""
     if not newly_queued and not newly_skipped:
         return
 
@@ -111,12 +127,7 @@ def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decis
             lines.append(f"  • Заказ {zakaz} / {satellite}: средняя облачность {avg_cloud}% (порог {config.CLOUD_THRESHOLD_PERCENT}%)")
         lines.append("")
 
-    context_lines = []
-    for zakaz in _sorted_zakazy(all_decisions.keys()):
-        for satellite, info in all_decisions[zakaz].items():
-            status_ru = _STATUS_RU.get(info["status"], info["status"])
-            context_lines.append(f"  • Заказ {zakaz} / {satellite}: {status_ru}")
-
+    context_lines = _status_lines(all_decisions)
     if context_lines:
         lines.append("-" * 40)
         lines.append("")
@@ -127,14 +138,39 @@ def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decis
     _send_email("Обработка снимков -- изменения в очереди", "\n".join(lines))
 
 
-def notify_processing_done(zakaz, date_str, satellite, result: dict = None) -> None:
-    body = (
-        f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\n"
-        f"Обработка завершена -- мозаика, водная маска и 8-бит готовы на Google Drive."
-    )
-    _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", body)
+def notify_processing_done(zakaz, date_str, satellite, result: dict = None, all_decisions: dict = None) -> None:
+    """Та же форма письма, что у notify_processing_summary -- раздел
+    "готово" + раздел "текущее состояние всех заказов"."""
+    lines = [
+        "ГОТОВО:", "",
+        f"  • Заказ {zakaz} / {satellite}: мозаика, водная маска и 8-бит на Google Drive", "",
+    ]
+
+    if all_decisions:
+        context_lines = _status_lines(all_decisions)
+        if context_lines:
+            lines.append("-" * 40)
+            lines.append("")
+            lines.append("ТЕКУЩЕЕ СОСТОЯНИЕ ВСЕХ ЗАКАЗОВ (для справки):")
+            lines.append("")
+            lines += context_lines
+
+    _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
 
 
-def notify_processing_failed(zakaz, date_str, satellite, error: str) -> None:
-    body = f"Заказ {zakaz}, спутник {satellite}, дата {date_str}.\nОбработка завершилась с ошибкой:\n\n{error}"
-    _send_email(f"[Ошибка обработки] Заказ {zakaz} / {satellite} / {date_str}", body)
+def notify_processing_failed(zakaz, date_str, satellite, error: str, all_decisions: dict = None) -> None:
+    lines = [
+        "ОШИБКА ОБРАБОТКИ:", "",
+        f"  • Заказ {zakaz} / {satellite}", "", error, "",
+    ]
+
+    if all_decisions:
+        context_lines = _status_lines(all_decisions)
+        if context_lines:
+            lines.append("-" * 40)
+            lines.append("")
+            lines.append("ТЕКУЩЕЕ СОСТОЯНИЕ ВСЕХ ЗАКАЗОВ (для справки):")
+            lines.append("")
+            lines += context_lines
+
+    _send_email(f"[Ошибка обработки] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
