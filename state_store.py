@@ -91,6 +91,23 @@ def set_processing_decision(zakaz, date_str: str, satellite: str, decision: str)
     storage.upload_json(DECISIONS_BLOB, data)
 
 
+def get_all_decisions_for_date(date_str: str) -> dict:
+    """Все известные решения (queued/done/skipped_cloud/failed) за
+    указанную дату в виде {zakaz: {satellite: status}} -- чтобы показать
+    полную картину в письмах (та же форма, что письмо про очередь)."""
+    data = storage.download_json(DECISIONS_BLOB, default={})
+    result = {}
+    for key, status in data.items():
+        parts = key.split("_")
+        if len(parts) != 3:
+            continue
+        zakaz, key_date, satellite = parts
+        if key_date != date_str:
+            continue
+        result.setdefault(zakaz, {})[satellite] = status
+    return result
+
+
 # ============================== Очередь заданий на обработку ==============================
 
 def write_queue_job(blob_path: str, job: dict) -> None:
@@ -119,14 +136,15 @@ def mark_job_done(job_blob_path: str, job: dict) -> None:
 
 def mark_job_failed(job_blob_path: str, job: dict, error: str) -> None:
     """Задание с ошибкой уходит в queue/done/FAILED_*.json и удаляется из
-    очереди. Решение processing_decision НЕ трогаем -- остаётся "queued",
-    чтобы задание не запустилось заново автоматически при следующем
-    обнаружении тех же сцен. Для повторной попытки после починки причины
-    сбоя удалите файл FAILED_*.json и соответствующую запись в
-    state/processing_decisions.json вручную (или используйте ручной
-    запуск process.yml с zakaz/satellite)."""
+    очереди. Решение processing_decision выставляется в "failed" (было
+    "queued" -- вводило в заблуждение в письмах: задание давно упало, а
+    показывалось как "в очереди"). Побочный эффект: raз "failed" не
+    входит в список статусов, блокирующих повторную постановку в
+    очередь (readiness.py), при следующем обнаружении тех же готовых
+    сцен задание автоматически попробует поставиться в очередь заново."""
     failed_job = dict(job)
     failed_job["error"] = str(error)
     filename = job_blob_path.rsplit("/", 1)[-1]
     storage.upload_json(f"{config.QUEUE_DONE_PREFIX}/FAILED_{filename}", failed_job)
     storage.delete_blob(job_blob_path)
+    set_processing_decision(job["zakaz"], job["date"], job["satellite"], "failed")
