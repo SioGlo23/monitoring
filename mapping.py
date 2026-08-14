@@ -54,7 +54,7 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
 
     def _cloud_label(p: dict) -> str:
         cc = p.get("cloud_cover")
-        return f"{cc}%" if isinstance(cc, (int, float)) else "нет данных"
+        return f"{round(cc, 2)}%" if isinstance(cc, (int, float)) else "нет данных"
 
     def _quicklook_html(p: dict) -> str:
         link = p.get("quicklook_link")
@@ -62,13 +62,20 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             return "нет квиклука"
         return f'<img src="{link}" style="max-width:220px;max-height:220px;">'
 
+    # Один и тот же набор полей и при наведении, и при клике (по просьбе) --
+    # ID убран, значения переносятся на новую строку, если не помещаются
+    # (word-wrap в style), окно достаточно широкое (max_width/min-width).
+    _DETAIL_STYLE = (
+        "white-space: normal; word-wrap: break-word; overflow-wrap: break-word; "
+        "max-width: 340px; min-width: 220px;"
+    )
+
     s2_features = [
         {
             "type": "Feature",
             "geometry": p["GeoFootprint"],
             "properties": {
                 "scene_name": p.get("Name", "Unknown"),
-                "scene_id": p.get("Id", "No ID"),
                 "cloud_cover_label": _cloud_label(p),
                 "start_time_msk": p.get("start_time_msk", "—"),
                 "published_msk": p.get("published_msk", "—"),
@@ -79,23 +86,17 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
         for prods in current_s2.values() for p in prods if p.get("GeoFootprint")
     ]
     if s2_features:
+        s2_fields = ["scene_name", "cloud_cover_label", "start_time_msk", "published_msk", "discovered_msk", "quicklook_html"]
+        s2_aliases = ["Сцена:", "Облачность:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):", "Квиклук:"]
         folium.GeoJson(
             {"type": "FeatureCollection", "features": s2_features},
             name="Sentinel-2 L1C",
             style_function=lambda x: {"color": "#8B00FF", "weight": 2.5, "fillOpacity": 0.25},
-            # При наведении -- лёгкая текстовая подсказка (без картинки, чтобы
-            # не тормозить hover). При КЛИКЕ -- окно с той же информацией плюс
-            # квиклук, которое остаётся открытым, пока не кликнуть в другое
-            # место (в отличие от tooltip, popup не закрывается при уходе курсора).
-            tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "cloud_cover_label", "start_time_msk"],
-                aliases=["Сцена:", "Облачность:", "Съёмка (МСК):"],
-            ),
-            popup=folium.GeoJsonPopup(
-                fields=["scene_name", "scene_id", "cloud_cover_label", "start_time_msk", "published_msk", "discovered_msk", "quicklook_html"],
-                aliases=["Сцена:", "ID:", "Облачность:", "Съёмка (МСК):", "Публикация (МСК):", "Обнаружено (МСК):", "Квиклук:"],
-                max_width=320,
-            ),
+            # Тултип (наведение) и попап (клик) показывают ОДНИ И ТЕ ЖЕ поля.
+            # Попап, в отличие от тултипа, не закрывается при уходе курсора --
+            # закрывается только по клику в другое место карты.
+            tooltip=folium.GeoJsonTooltip(fields=s2_fields, aliases=s2_aliases, style=_DETAIL_STYLE),
+            popup=folium.GeoJsonPopup(fields=s2_fields, aliases=s2_aliases, style=_DETAIL_STYLE, max_width=360),
             show=True,
         ).add_to(m)
 
@@ -105,7 +106,6 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             "geometry": p["GeoFootprint"],
             "properties": {
                 "scene_name": p.get("Name", "Unknown"),
-                "scene_id": p.get("Id", "No ID"),
                 "PR": p.get("PR", "—"),
                 "cloud_cover_label": _cloud_label(p),
                 "start_time_msk": p.get("start_time_msk", "—"),
@@ -116,19 +116,14 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
         for prods in current_landsat.values() for p in prods if p.get("GeoFootprint")
     ]
     if landsat_features:
+        l_fields = ["scene_name", "PR", "cloud_cover_label", "start_time_msk", "discovered_msk", "quicklook_html"]
+        l_aliases = ["Сцена:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):", "Квиклук:"]
         folium.GeoJson(
             {"type": "FeatureCollection", "features": landsat_features},
             name="Landsat 8/9 Level-1",
             style_function=lambda x: {"color": "#FF8C00", "weight": 2.5, "fillOpacity": 0.25},
-            tooltip=folium.GeoJsonTooltip(
-                fields=["scene_name", "PR", "cloud_cover_label", "start_time_msk"],
-                aliases=["Сцена:", "PR:", "Облачность:", "Съёмка (МСК):"],
-            ),
-            popup=folium.GeoJsonPopup(
-                fields=["scene_name", "scene_id", "PR", "cloud_cover_label", "start_time_msk", "discovered_msk", "quicklook_html"],
-                aliases=["Сцена:", "ID:", "PR:", "Облачность:", "Съёмка (МСК):", "Обнаружено (МСК):", "Квиклук:"],
-                max_width=320,
-            ),
+            tooltip=folium.GeoJsonTooltip(fields=l_fields, aliases=l_aliases, style=_DETAIL_STYLE),
+            popup=folium.GeoJsonPopup(fields=l_fields, aliases=l_aliases, style=_DETAIL_STYLE, max_width=360),
             show=True,
         ).add_to(m)
 
