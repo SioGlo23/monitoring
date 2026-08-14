@@ -72,7 +72,7 @@ def logout(session_id):
 def _extract_cloud_cover(scene: dict):
     raw = scene.get("cloudCover")
     try:
-        return float(raw)
+        return round(float(raw), 2)
     except (TypeError, ValueError):
         return None
 
