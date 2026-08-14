@@ -47,7 +47,7 @@ def _extract_cloud_cover(product: dict):
     for attr in product.get("Attributes", []) or []:
         if attr.get("Name") == "cloudCover":
             try:
-                return float(attr.get("Value"))
+                return round(float(attr.get("Value")), 2)
             except (TypeError, ValueError):
                 return None
     return None
