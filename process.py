@@ -316,13 +316,15 @@ def _run_queue() -> dict:
         try:
             result = _process_job(job, aoi_dict)
             state_store.mark_job_done(job_blob, job)
-            notifier.notify_processing_done(job["zakaz"], job["date"], job["satellite"], result)
+            all_decisions = state_store.get_all_decisions_for_date(job["date"])
+            notifier.notify_processing_done(job["zakaz"], job["date"], job["satellite"], result, all_decisions)
             processed += 1
         except Exception as exc:  # noqa: BLE001
             logger.error("Задание %s завершилось с ошибкой: %s", job_blob, exc)
             traceback.print_exc()
             state_store.mark_job_failed(job_blob, job, str(exc))
-            notifier.notify_processing_failed(job["zakaz"], job["date"], job["satellite"], str(exc))
+            all_decisions = state_store.get_all_decisions_for_date(job["date"])
+            notifier.notify_processing_failed(job["zakaz"], job["date"], job["satellite"], str(exc), all_decisions)
             process_log.log_operation(job["zakaz"], "Завершение заказа (ошибка)", None, 0.0, "ERROR")
             failed += 1
 
@@ -359,11 +361,13 @@ def _run_manual(zakaz: str, satellite: str, date_override: str = None) -> dict:
     job = {"zakaz": str(zakaz), "date": monitor_date, "satellite": satellite, "products": products}
     try:
         result = _process_job(job, aoi_dict)
-        notifier.notify_processing_done(zakaz, monitor_date, satellite, result)
+        all_decisions = state_store.get_all_decisions_for_date(monitor_date)
+        notifier.notify_processing_done(zakaz, monitor_date, satellite, result, all_decisions)
         return {"jobs_processed": 1, "jobs_failed": 0}
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
-        notifier.notify_processing_failed(zakaz, monitor_date, satellite, str(exc))
+        all_decisions = state_store.get_all_decisions_for_date(monitor_date)
+        notifier.notify_processing_failed(zakaz, monitor_date, satellite, str(exc), all_decisions)
         process_log.log_operation(zakaz, "Завершение заказа (ошибка)", None, 0.0, "ERROR")
         return {"jobs_processed": 0, "jobs_failed": 1}
 
