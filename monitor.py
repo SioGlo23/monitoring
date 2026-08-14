@@ -66,16 +66,21 @@ def _fetch_quicklook(satellite: str, p: dict) -> str:
     его можно было встроить как <img> прямо в тултип карты). Возвращает
     ссылку или None -- при любой ошибке просто логирует и не мешает
     остальной детекции (квиклук -- вспомогательная функция)."""
-    local_path = os.path.join(config.LOCAL_TMP_DIR, "quicklooks", f"{p.get('Name')}.png")
+    quicklooks_dir = os.path.join(config.LOCAL_TMP_DIR, "quicklooks")
+    os.makedirs(quicklooks_dir, exist_ok=True)  # раньше создавалась только побочным эффектом S2-ветки
+    local_path = os.path.join(quicklooks_dir, f"{p.get('Name')}.png")
     try:
         if satellite == "S2":
             if not s2_download.download_quicklook(p, local_path):
+                logger.info("Квиклук для %s (S2): не найден/не скачался", p.get("Name"))
                 return None
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.png"
             link = storage.upload_file(local_path, blob_path, content_type="image/png", public=True)
+            logger.info("Квиклук для %s (S2) сохранён: %s", p.get("Name"), link)
         else:
             url = p.get("quicklook_url")
             if not url:
+                logger.info("Квиклук для %s (Landsat): в метаданных сцены нет browse/quicklook_url", p.get("Name"))
                 return None
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
@@ -84,6 +89,7 @@ def _fetch_quicklook(satellite: str, p: dict) -> str:
                 f.write(resp.content)
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.jpg"
             link = storage.upload_file(local_path, blob_path, content_type="image/jpeg", public=True)
+            logger.info("Квиклук для %s (Landsat) сохранён: %s", p.get("Name"), link)
         return link
     except Exception as exc:  # noqa: BLE001
         logger.warning("Квиклук для %s (%s) не скачан: %s", p.get("Name"), satellite, exc)
@@ -342,7 +348,11 @@ def run_once() -> dict:
             elif info["status"] == "skipped_cloud":
                 newly_skipped.append((zakaz, satellite, info["avg_cloud"]))
     if newly_queued or newly_skipped:
-        notifier.notify_processing_summary(newly_queued, newly_skipped, decisions_by_zakaz)
+        status_only = {
+            zakaz: {satellite: info["status"] for satellite, info in sats.items()}
+            for zakaz, sats in decisions_by_zakaz.items()
+        }
+        notifier.notify_processing_summary(newly_queued, newly_skipped, status_only)
 
     if newly_queued:
         _trigger_process_workflow()
