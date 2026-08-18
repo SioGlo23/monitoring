@@ -60,7 +60,14 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
         link = p.get("quicklook_link")
         if not link:
             return "нет квиклука"
-        return f'<img src="{link}" style="max-width:220px;max-height:220px;">'
+        # Картинка + текстовая ссылка рядом: если картинка по какой-то
+        # причине не отрисуется (доступ к файлу на Диске, блокировка
+        # хотлинка и т.п.), останется рабочая ссылка, по которой квиклук
+        # всё равно можно открыть.
+        return (
+            f'<img src="{link}" style="max-width:300px;max-height:300px;display:block;margin-bottom:4px;">'
+            f'<a href="{link}" target="_blank">открыть отдельно</a>'
+        )
 
     # Один и тот же набор полей и при наведении, и при клике (по просьбе) --
     # ID убран, значения переносятся на новую строку, если не помещаются
