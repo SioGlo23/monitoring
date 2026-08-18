@@ -1,7 +1,3 @@
-"""Интерактивная карта (MODIS + AOI + Sentinel-2 + Landsat) -- как в исходном ноутбуке.
-Без изменений в рамках этого обновления."""
-import logging
-import os
 
 import folium
 
@@ -29,6 +25,48 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
     center = [(miny + maxy) / 2, (minx + maxx) / 2]
 
     m = folium.Map(location=center, zoom_start=5)
+
+    # Карточки Leaflet по умолчанию расширяются под содержимое: длинное имя
+    # сцены -- это один "неразрывный" токен без пробелов, а таблица без
+    # table-layout:fixed растягивается под него и вылезает за рамку. Плюс
+    # у тултипов Leaflet по умолчанию white-space:nowrap. Этот блок стилей
+    # чинит и то, и другое, и заодно вписывает картинку квиклука в ширину
+    # ячейки.
+    m.get_root().header.add_child(folium.Element("""
+<style>
+  .leaflet-popup-content, .leaflet-tooltip {
+      max-width: 360px !important;
+      white-space: normal !important;
+  }
+  .leaflet-popup-content table, .leaflet-tooltip table {
+      width: 100%;
+      table-layout: fixed;   /* ключевое: таблица не шире контейнера */
+      border-collapse: collapse;
+  }
+  .leaflet-popup-content table th, .leaflet-tooltip table th {
+      width: 34%;
+      text-align: left;
+      vertical-align: top;
+      padding: 2px 6px 2px 0;
+      white-space: normal;
+      overflow-wrap: break-word;
+      word-break: normal;
+  }
+  .leaflet-popup-content table td, .leaflet-tooltip table td {
+      width: 66%;
+      vertical-align: top;
+      padding: 2px 0;
+      white-space: normal;
+      overflow-wrap: anywhere;   /* рвёт длинное имя сцены по любому месту */
+      word-break: break-all;
+  }
+  .leaflet-popup-content img, .leaflet-tooltip img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+  }
+</style>
+"""))
 
     folium.WmsTileLayer(
         url="https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi",
@@ -60,22 +98,19 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
         link = p.get("quicklook_link")
         if not link:
             return "нет квиклука"
-        # Картинка + текстовая ссылка рядом: если картинка по какой-то
-        # причине не отрисуется (доступ к файлу на Диске, блокировка
-        # хотлинка и т.п.), останется рабочая ссылка, по которой квиклук
-        # всё равно можно открыть.
+        # Ширину задаёт CSS выше (max-width:100% от ячейки) -- жёсткий
+        # размер в px здесь как раз и заставлял картинку вылезать за рамку.
+        # Текстовая ссылка рядом -- на случай, если картинка не отрисуется.
         return (
-            f'<img src="{link}" style="max-width:300px;max-height:300px;display:block;margin-bottom:4px;">'
+            f'<img src="{link}" alt="квиклук">'
             f'<a href="{link}" target="_blank">открыть отдельно</a>'
         )
 
-    # Один и тот же набор полей и при наведении, и при клике (по просьбе) --
-    # ID убран, значения переносятся на новую строку, если не помещаются
-    # (word-wrap в style), окно достаточно широкое (max_width/min-width).
-    _DETAIL_STYLE = (
-        "white-space: normal; word-wrap: break-word; overflow-wrap: break-word; "
-        "max-width: 340px; min-width: 220px;"
-    )
+    # Один и тот же набор полей и при наведении, и при клике (по просьбе),
+    # ID убран. Перенос длинных значений и вписывание картинки в рамку
+    # задаются глобальным блоком стилей выше (по классам Leaflet) --
+    # здесь только минимальная ширина, чтобы карточка не схлопывалась.
+    _DETAIL_STYLE = "min-width: 240px;"
 
     s2_features = [
         {
@@ -134,8 +169,58 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
             show=True,
         ).add_to(m)
 
+    _add_quicklook_overlays(m, current_s2, current_landsat)
+
     folium.LayerControl().add_to(m)
     return m
+
+
+def _add_quicklook_overlays(m, current_s2: dict, current_landsat: dict) -> None:
+    """Кладёт геопривязанные квиклуки слоями на карту: все Sentinel-2 в
+    один слой, все Landsat -- в другой (галочки в LayerControl).
+
+    Картинки берутся с Google Drive и ВСТРАИВАЮТСЯ в HTML карты как
+    base64 (folium делает это сам, когда ImageOverlay получает путь к
+    локальному файлу). Это надёжнее ссылок на Drive: карта не зависит от
+    доступности файлов и работает даже открытая локально. Размер картинок
+    ограничен config.QUICKLOOK_MAX_PX как раз чтобы HTML не распухал."""
+    tmp_dir = os.path.join(config.LOCAL_TMP_DIR, "quicklooks_map")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    groups = (
+        ("Квиклуки Sentinel-2", current_s2),
+        ("Квиклуки Landsat 8/9", current_landsat),
+    )
+
+    for group_name, prods_dict in groups:
+        group = folium.FeatureGroup(name=group_name, show=config.QUICKLOOK_LAYERS_SHOW_BY_DEFAULT)
+        added = 0
+
+        for prods in prods_dict.values():
+            for p in prods:
+                blob = p.get("quicklook_geo_blob")
+                bounds = p.get("quicklook_geo_bounds")
+                if not blob or not bounds:
+                    continue
+                try:
+                    local_path = os.path.join(tmp_dir, os.path.basename(blob))
+                    if not os.path.exists(local_path):
+                        storage.download_to_file(blob, local_path)
+                    folium.raster_layers.ImageOverlay(
+                        image=local_path,
+                        bounds=bounds,
+                        opacity=config.QUICKLOOK_OVERLAY_OPACITY,
+                        interactive=False,   # чтобы не перехватывать клики у контуров сцен
+                        cross_origin=False,
+                        zindex=1,
+                    ).add_to(group)
+                    added += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Квиклук-слой: не удалось добавить %s: %s", blob, exc)
+
+        if added:
+            group.add_to(m)
+            logger.info("Слой '%s': добавлено %s квиклук(ов)", group_name, added)
 
 
 def save_map(m, cycle_ts: str, cycle_number: int):
