@@ -1,3 +1,7 @@
+"""Интерактивная карта (MODIS + AOI + Sentinel-2 + Landsat) -- как в исходном ноутбуке.
+Без изменений в рамках этого обновления."""
+import logging
+import os
 
 import folium
 
