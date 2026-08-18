@@ -77,6 +77,25 @@ def utm_crs_for_shape(shape_obj) -> str:
     return f"EPSG:326{zone:02d}" if center_lon >= 0 else f"EPSG:327{zone:02d}"
 
 
+def utm_crs_for_s2_tile(tile_code: str):
+    """UTM-зона по коду тайла Sentinel-2 ('41VPD' -> EPSG:32641).
+
+    Точнее, чем определение по центроиду: тайл ВСЕГДА задан в своей
+    UTM-зоне, а его центроид у краевых тайлов может попадать в соседнюю
+    зону. Буква после номера зоны -- широтный пояс: C..M -- южное
+    полушарие, N..X -- северное. Возвращает None, если код не разобран."""
+    if not tile_code or len(tile_code) < 3:
+        return None
+    try:
+        zone = int(tile_code[:2])
+    except ValueError:
+        return None
+    band = tile_code[2].upper()
+    if not ("C" <= band <= "X"):
+        return None
+    return f"EPSG:326{zone:02d}" if band >= "N" else f"EPSG:327{zone:02d}"
+
+
 def compressed_profile(base_profile: dict, count: int, dtype: str = "uint16") -> dict:
     """Единый профиль вывода: заданный dtype + сжатие ZSTD + тайлинг."""
     profile = base_profile.copy()
