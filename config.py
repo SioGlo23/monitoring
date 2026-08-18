@@ -137,3 +137,20 @@ CLOUD_THRESHOLD_PERCENT = float(os.environ.get("CLOUD_THRESHOLD_PERCENT", "70"))
 
 # Куда сохранять квиклуки (загрубленные превью) новых сцен
 QUICKLOOKS_PREFIX = os.environ.get("QUICKLOOKS_PREFIX", "logs/quicklooks")
+
+# Куда сохранять ГЕОПРИВЯЗАННЫЕ квиклуки (перепроецированные в EPSG:4326
+# RGBA-PNG), которые кладутся слоем на карту.
+QUICKLOOKS_GEO_PREFIX = os.environ.get("QUICKLOOKS_GEO_PREFIX", "logs/quicklooks/geo")
+
+# Ограничение размера геопривязанного квиклука по длинной стороне.
+# Картинки инлайнятся в HTML карты как base64, поэтому чем больше
+# размер -- тем тяжелее файл карты (512 px ~ 100-300 КБ на сцену).
+QUICKLOOK_MAX_PX = int(os.environ.get("QUICKLOOK_MAX_PX", "512"))
+
+# Прозрачность слоя квиклуков на карте
+QUICKLOOK_OVERLAY_OPACITY = float(os.environ.get("QUICKLOOK_OVERLAY_OPACITY", "0.85"))
+
+# Показывать ли слои квиклуков сразу при открытии карты. По умолчанию
+# выключено -- слои включаются галочкой, чтобы карта не загромождалась
+# и открывалась быстрее.
+QUICKLOOK_LAYERS_SHOW_BY_DEFAULT = os.environ.get("QUICKLOOK_LAYERS_SHOW", "").lower() in ("1", "true", "yes")
