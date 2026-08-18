@@ -42,7 +42,7 @@ import readiness
 import state_store
 import storage
 import utils
-from pipeline import s2_download
+from pipeline import quicklook_geo, s2_download
 from providers import copernicus, modis, usgs_m2m
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -61,57 +61,99 @@ if _missing_utils:
     )
 
 
-def _fetch_quicklook(satellite: str, p: dict) -> str:
-    """Скачивает квиклук новой сцены и заливает на Drive ПУБЛИЧНО (чтобы
-    его можно было встроить как <img> прямо в тултип карты). Возвращает
-    ссылку или None -- при любой ошибке просто логирует и не мешает
-    остальной детекции (квиклук -- вспомогательная функция)."""
+def _fetch_quicklook(satellite: str, p: dict) -> dict:
+    """Скачивает квиклук новой сцены, заливает на Drive ПУБЛИЧНО (чтобы
+    показывать как <img> в карточке) и дополнительно делает
+    ГЕОПРИВЯЗАННУЮ версию (RGBA-PNG в EPSG:4326) для слоя на карте.
+
+    Возвращает словарь с ключами quicklook_link / quicklook_geo_blob /
+    quicklook_geo_bounds (любой может быть None). При любой ошибке просто
+    логирует и не мешает остальной детекции -- квиклук вспомогательная
+    функция."""
+    result = {"quicklook_link": None, "quicklook_geo_blob": None, "quicklook_geo_bounds": None}
+
     quicklooks_dir = os.path.join(config.LOCAL_TMP_DIR, "quicklooks")
-    os.makedirs(quicklooks_dir, exist_ok=True)  # раньше создавалась только побочным эффектом S2-ветки
+    os.makedirs(quicklooks_dir, exist_ok=True)
     local_path = os.path.join(quicklooks_dir, f"{p.get('Name')}.png")
+    geo_local_path = os.path.join(quicklooks_dir, f"{p.get('Name')}_4326.png")
+
     try:
         if satellite == "S2":
             if not s2_download.download_quicklook(p, local_path):
                 logger.info("Квиклук для %s (S2): не найден/не скачался", p.get("Name"))
-                return None
+                return result
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.png"
-            link = storage.upload_file(local_path, blob_path, content_type="image/png", public=True)
-            logger.info("Квиклук для %s (S2) сохранён: %s", p.get("Name"), link)
+            result["quicklook_link"] = storage.upload_file(
+                local_path, blob_path, content_type="image/png", public=True
+            )
         else:
             url = p.get("quicklook_url")
             if not url:
                 logger.info("Квиклук для %s (Landsat): в метаданных сцены нет browse/quicklook_url", p.get("Name"))
-                return None
+                return result
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            local_path = local_path.replace(".png", ".jpg")
             with open(local_path, "wb") as f:
                 f.write(resp.content)
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.jpg"
-            link = storage.upload_file(local_path, blob_path, content_type="image/jpeg", public=True)
-            logger.info("Квиклук для %s (Landsat) сохранён: %s", p.get("Name"), link)
-        return link
+            result["quicklook_link"] = storage.upload_file(
+                local_path, blob_path, content_type="image/jpeg", public=True
+            )
+        logger.info("Квиклук для %s (%s) сохранён", p.get("Name"), satellite)
+
+        # --- геопривязанная версия для слоя на карте ---
+        footprint = p.get("GeoFootprint")
+        if not footprint:
+            logger.info("Геопривязка %s: нет GeoFootprint -- слой на карте пропущен", p.get("Name"))
+            return result
+
+        if satellite == "S2":
+            # Тайл ВСЕГДА задан в своей UTM-зоне, поэтому берём её из кода
+            # тайла, а не по центроиду (у краевых тайлов расходится).
+            src_crs = utils.utm_crs_for_s2_tile(p.get("tile_code")) or utils.utm_crs_for_shape(shape(footprint))
+        else:
+            src_crs = utils.utm_crs_for_shape(shape(footprint))
+
+        bounds = quicklook_geo.georeference_quicklook(
+            local_path, footprint, src_crs, geo_local_path, max_px=config.QUICKLOOK_MAX_PX
+        )
+        if bounds:
+            geo_blob = f"{config.QUICKLOOKS_GEO_PREFIX}/{p['Name']}_4326.png"
+            storage.upload_file(geo_local_path, geo_blob, content_type="image/png")
+            result["quicklook_geo_blob"] = geo_blob
+            result["quicklook_geo_bounds"] = bounds
+
+        return result
+
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Квиклук для %s (%s) не скачан: %s", p.get("Name"), satellite, exc)
-        return None
+        logger.warning("Квиклук для %s (%s) не обработан: %s", p.get("Name"), satellite, exc)
+        return result
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+        for path in (local_path, geo_local_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def _merge_with_previous(satellite: str, prods: list, previous_prods: list, discovered_readable: str) -> None:
-    """Проставляет discovered_msk/is_new/quicklook_link, сравнивая с
-    предыдущим известным списком, и скачивает квиклуки для НОВЫХ сцен."""
+    """Проставляет discovered_msk/is_new и данные квиклука, сравнивая с
+    предыдущим известным списком. Квиклук скачивается и привязывается
+    только для НОВЫХ сцен -- для уже известных данные переносятся из
+    памяти прошлого прогона."""
+    quicklook_keys = ("quicklook_link", "quicklook_geo_blob", "quicklook_geo_bounds")
+
     for p in prods:
         old_match = next((o for o in previous_prods if o.get("Id") == p.get("Id")), None)
         p["discovered_msk"] = old_match["discovered_msk"] if old_match else discovered_readable
         p["is_new"] = old_match is None
-        if old_match and old_match.get("quicklook_link"):
-            p["quicklook_link"] = old_match["quicklook_link"]
+
+        if old_match and any(old_match.get(k) for k in quicklook_keys):
+            for k in quicklook_keys:
+                p[k] = old_match.get(k)
         elif p["is_new"]:
-            p["quicklook_link"] = _fetch_quicklook(satellite, p)
+            p.update(_fetch_quicklook(satellite, p))
         else:
-            p["quicklook_link"] = None
+            for k in quicklook_keys:
+                p[k] = None
 
 
 def _trigger_process_workflow() -> None:
