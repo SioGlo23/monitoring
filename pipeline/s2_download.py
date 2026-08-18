@@ -192,92 +192,38 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
     return out_dir
 
 
-def download_quicklook(prod: dict, out_path: str) -> bool:
-    """Скачивает загрубленное превью (quicklook) сцены. Ищет в
-    manifest.safe ЛЮБОЙ файл, чей href содержит "preview" (без жёсткого
-    требования к расширению -- у части продуктов превью лежит в .jp2,
-    не в .png/.jpg). Если найденный файл не в веб-совместимом формате
-    (png/jpg), скачивает его как есть и конвертирует в PNG через
-    rasterio+Pillow, чтобы картинка реально открывалась в браузере
-    (<img> не умеет показывать JPEG2000).
+_CDSE_CATALOGUE_ODATA = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 
-    Возвращает False (не бросает исключение), если не получилось --
-    квиклук вспомогательная функция, её отсутствие не должно ронять
-    детекцию."""
-    prod_name = prod["Name"]
-    prod_id = prod["Id"]
-    safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    cdse = _CdseSession()
-
-    manifest_path = out_path + ".manifest.safe"
-    cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
-    if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
-        logger.warning("Квиклук %s: не удалось скачать manifest.safe", prod_name[:40])
-        return False
-
-    try:
-        root = ET.parse(manifest_path).getroot()
-    except ET.ParseError as e:
-        logger.warning("Квиклук %s: ошибка парсинга manifest.safe: %s", prod_name[:40], e)
-        os.remove(manifest_path)
-        return False
-
-    candidates = []
-    for elem in root.iter():
-        if elem.tag.endswith("fileLocation"):
-            href = elem.get("href", "")
-            if "preview" in href.lower():
-                candidates.append(href.lstrip("./"))
-
-    os.remove(manifest_path)
-
-    if not candidates:
-        logger.warning("Квиклук %s: в manifest.safe не найден ни один файл с 'preview' в пути", prod_name[:40])
-        return False
-
-    # Предпочитаем уже веб-совместимый формат, если он есть среди найденных.
-    def _priority(href: str) -> int:
-        return 0 if href.lower().endswith((".png", ".jpg", ".jpeg")) else 1
-    candidates.sort(key=_priority)
-    preview_rel_path = candidates[0]
-
-    parts = [safe_name] + [s for s in preview_rel_path.split("/") if s]
-    raw_ext = os.path.splitext(preview_rel_path)[1].lower()
-
-    if raw_ext in (".png", ".jpg", ".jpeg"):
-        ok = cdse.download_node_file(prod_id, parts, out_path)
-        if not ok:
-            logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
-        return ok
-
-    # Формат не веб-совместимый (обычно .jp2) -- скачиваем во временный
-    # файл и конвертируем в PNG.
-    tmp_path = out_path + raw_ext
-    if not cdse.download_node_file(prod_id, parts, tmp_path):
-        logger.warning("Квиклук %s: найден путь %s, но скачать не удалось", prod_name[:40], preview_rel_path)
-        return False
-
-    ok = _convert_preview_to_png(tmp_path, out_path)
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    if not ok:
-        logger.warning("Квиклук %s: скачан (%s), но не удалось сконвертировать в PNG", prod_name[:40], raw_ext)
-    return ok
+# Шаблоны имён превью внутри SAFE-пакета Sentinel-2. ВАЖНО: у Sentinel-2
+# превью называется PVI (Preview Image) и лежит в GRANULE/.../QI_DATA/,
+# а НЕ в папке "preview" (это структура Sentinel-1). Остальные шаблоны --
+# на случай других версий обработки.
+_PREVIEW_NAME_PATTERNS = ("_pvi.", "quick-look.", "quicklook.", "-ql.", "_ql.")
+_PREVIEW_IMAGE_EXTS = (".jp2", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
 
-def _convert_preview_to_png(src_path: str, dst_path: str) -> bool:
-    """Конвертирует превью (обычно .jp2) в обычный PNG, который умеет
-    показать <img> в браузере. Простая линейная нормализация в 0..255
-    по 1-99 перцентилям на канал -- превью и так низкого разрешения,
-    сложная цветокоррекция тут не нужна."""
+def _normalize_to_png(src_path: str, dst_path: str) -> bool:
+    """Приводит любое скачанное превью (JPEG/PNG/JP2/TIFF) к обычному PNG,
+    который гарантированно показывает <img> в браузере. Сначала пробуем
+    Pillow (умеет JPEG/PNG/TIFF), затем rasterio (умеет JPEG2000, который
+    Pillow обычно не читает)."""
     try:
         from PIL import Image
     except ImportError:
-        logger.warning("Pillow не установлен -- конвертация превью в PNG невозможна")
+        logger.warning("Pillow не установлен -- превью не будет сконвертировано в PNG")
         return False
 
+    # Попытка 1 -- обычные растровые форматы через Pillow
+    try:
+        with Image.open(src_path) as img:
+            img.convert("RGB").save(dst_path, format="PNG")
+        return True
+    except Exception:
+        pass
+
+    # Попытка 2 -- JPEG2000 и прочее через rasterio, с линейной
+    # нормализацией по 1-99 перцентилям (превью и так низкого разрешения,
+    # сложная цветокоррекция здесь не нужна)
     try:
         with rasterio.open(src_path) as src:
             data = src.read()
@@ -296,13 +242,158 @@ def _convert_preview_to_png(src_path: str, dst_path: str) -> bool:
             elif data.shape[0] >= 3:
                 img = Image.fromarray(np.moveaxis(data[:3], 0, -1), mode="RGB")
             else:
+                logger.warning("Превью: неожиданное число каналов (%s)", data.shape[0])
                 return False
 
             img.save(dst_path, format="PNG")
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Ошибка конвертации превью в PNG: %s", exc)
+        logger.warning("Не удалось сконвертировать превью в PNG: %s", exc)
         return False
+
+
+def _quicklook_via_assets(cdse: "_CdseSession", prod_id: str, out_path: str) -> bool:
+    """Официальный способ CDSE: у продукта есть отдельные Assets, среди
+    которых ассет типа QUICKLOOK. Надёжнее, чем искать превью внутри
+    SAFE-пакета -- не зависит от версии обработки и структуры пакета."""
+    url = f"{_CDSE_CATALOGUE_ODATA}/Products({prod_id})/Assets"
+    r = cdse._http_get(url)
+    if r is None:
+        logger.info("Квиклук (Assets): запрос не выполнен (сетевая ошибка)")
+        return False
+    if r.status_code != 200:
+        logger.info("Квиклук (Assets): HTTP %s", r.status_code)
+        r.close()
+        return False
+    try:
+        assets = r.json().get("value", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Квиклук (Assets): не удалось разобрать ответ: %s", exc)
+        return False
+    finally:
+        r.close()
+
+    quicklooks = [a for a in assets if str(a.get("Type", "")).upper() == "QUICKLOOK"]
+    if not quicklooks:
+        types = sorted({str(a.get("Type")) for a in assets})
+        logger.info("Квиклук (Assets): ассета QUICKLOOK нет. Доступные типы: %s", types)
+        return False
+
+    asset = quicklooks[0]
+    download_link = asset.get("DownloadLink")
+    if not download_link and asset.get("Id"):
+        download_link = f"{_CDSE_CATALOGUE_ODATA}/Assets({asset['Id']})/$value"
+    if not download_link:
+        logger.info("Квиклук (Assets): у ассета QUICKLOOK нет ссылки на скачивание")
+        return False
+
+    tmp_path = out_path + ".asset"
+    rr = cdse._http_get(download_link, stream=True)
+    if rr is None or rr.status_code != 200:
+        logger.info("Квиклук (Assets): скачивание вернуло %s", getattr(rr, "status_code", "нет ответа"))
+        if rr is not None:
+            rr.close()
+        return False
+    try:
+        with rr, open(tmp_path, "wb") as f:
+            for chunk in rr.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    f.write(chunk)
+        ok = _normalize_to_png(tmp_path, out_path)
+        if ok:
+            logger.info("Квиклук получен через Assets (%s КБ)", os.path.getsize(out_path) // 1024)
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Квиклук (Assets): ошибка при скачивании: %s", exc)
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, out_path: str) -> bool:
+    """Запасной способ: ищем превью прямо внутри SAFE-пакета по
+    manifest.safe. У Sentinel-2 это файл *_PVI.jp2 в GRANULE/.../QI_DATA/."""
+    manifest_path = out_path + ".manifest.safe"
+    cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
+    if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
+        logger.info("Квиклук (manifest): не удалось скачать manifest.safe")
+        return False
+
+    try:
+        root = ET.parse(manifest_path).getroot()
+    except ET.ParseError as exc:
+        logger.info("Квиклук (manifest): ошибка парсинга: %s", exc)
+        return False
+    finally:
+        if os.path.exists(manifest_path):
+            os.remove(manifest_path)
+
+    candidates = []
+    for elem in root.iter():
+        if not elem.tag.endswith("fileLocation"):
+            continue
+        href = elem.get("href", "")
+        low = href.lower()
+        if not low.endswith(_PREVIEW_IMAGE_EXTS):
+            continue
+        # TCI -- это полноразмерное цветное изображение (сотни МБ), НЕ превью
+        if "tci" in low:
+            continue
+        if any(pat in low for pat in _PREVIEW_NAME_PATTERNS) or "/preview/" in low:
+            candidates.append(href.lstrip("./"))
+
+    if not candidates:
+        logger.info("Квиклук (manifest): подходящих файлов превью (PVI/quick-look) не найдено")
+        return False
+
+    # Уже веб-совместимые форматы -- в приоритете, конвертировать не придётся
+    candidates.sort(key=lambda h: 0 if h.lower().endswith((".png", ".jpg", ".jpeg")) else 1)
+    rel_path = candidates[0]
+    logger.info("Квиклук (manifest): найден %s", rel_path)
+
+    parts = [safe_name] + [s for s in rel_path.split("/") if s]
+    tmp_path = out_path + os.path.splitext(rel_path)[1].lower()
+    if not cdse.download_node_file(prod_id, parts, tmp_path):
+        logger.info("Квиклук (manifest): файл найден, но скачать не удалось")
+        return False
+
+    try:
+        return _normalize_to_png(tmp_path, out_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def download_quicklook(prod: dict, out_path: str) -> bool:
+    """Скачивает загрубленное превью (quicklook) сцены Sentinel-2 и
+    сохраняет его как PNG по пути out_path.
+
+    Пробует два способа по очереди:
+      1. Эндпоинт Assets в CDSE (ассет типа QUICKLOOK) -- официальный
+         способ, не зависит от структуры SAFE-пакета;
+      2. Поиск внутри SAFE по manifest.safe -- файл *_PVI.jp2 в
+         GRANULE/.../QI_DATA/ (у Sentinel-2 превью называется PVI и лежит
+         именно там, а НЕ в папке "preview" -- это структура Sentinel-1).
+
+    Возвращает False (не бросает исключение) при любой неудаче -- квиклук
+    вспомогательная функция, её отсутствие не должно ронять детекцию."""
+    prod_name = prod["Name"]
+    prod_id = prod["Id"]
+    safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    cdse = _CdseSession()
+
+    if _quicklook_via_assets(cdse, prod_id, out_path):
+        return True
+
+    logger.info("Квиклук %s: Assets не сработал, пробую через manifest.safe", prod_name[:45])
+    if _quicklook_via_manifest(cdse, prod_id, safe_name, out_path):
+        return True
+
+    logger.warning("Квиклук %s: не удалось получить ни одним способом", prod_name[:45])
+    return False
 
 
 def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
