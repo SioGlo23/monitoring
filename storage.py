@@ -208,8 +208,15 @@ def upload_file(local_path: str, blob_path: str, content_type: str = None, publi
                     fileId=file_id, body={"type": "anyone", "role": "reader"}
                 ).execute()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Не удалось открыть публичный доступ для %s: %s", blob_path, exc)
-            return f"https://drive.google.com/uc?export=view&id={file_id}"
+                logger.warning(
+                    "Не удалось открыть публичный доступ для %s: %s -- картинка не будет "
+                    "отображаться на карте (но файл на Диске сохранён)", blob_path, exc,
+                )
+            # ВАЖНО: именно /thumbnail, а не /uc?export=view. Google закрыл
+            # uc?export=view для встраивания в <img> -- он отдаёт HTML-страницу
+            # просмотрщика вместо байтов картинки, из-за чего <img> показывает
+            # "битую" иконку. /thumbnail отдаёт настоящее изображение.
+            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
 
         return f"https://drive.google.com/file/d/{file_id}/view"
 
