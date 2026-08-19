@@ -1,10 +1,11 @@
 """
 Обрезка/перепроекция композитов по AOI, сборка мозаики, построение
-пирамид (gdaladdo) -- прямой перенос Блока 8 исходного ноутбука,
+пирамид -- прямой перенос Блока 8 исходного ноутбука,
 работает только с локальными путями.
 """
 import logging
 import os
+import shutil
 import subprocess
 import time
 
@@ -108,23 +109,88 @@ def create_mosaic(composite_paths: list, aoi_shape, target_crs: str, mosaic_outp
     return mosaic_output_path
 
 
+def has_overviews(raster_path: str) -> bool:
+    """Есть ли у растра уже построенные пирамиды (внешние .ovr или внутренние)."""
+    try:
+        with rasterio.open(raster_path) as src:
+            return bool(src.overviews(1))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def build_pyramids(raster_path: str) -> bool:
+    """Строит пирамиды ОТДЕЛЬНЫМ файлом .ovr рядом с растром, средствами
+    rasterio -- без вызова внешней утилиты gdaladdo.
+
+    Почему без gdaladdo: он живёт в пакете gdal-bin, который приходилось
+    ставить через apt-get на каждом прогоне. Этот шаг регулярно зависал
+    на раннере (наблюдались прогоны по 1-6 часов, висящие именно на
+    apt-get). rasterio уже содержит GDAL внутри себя, поэтому внешняя
+    утилита не нужна вовсе.
+
+    Ключевой момент -- TIFF_USE_OVR=YES: без него GDAL в режиме
+    обновления ('r+') записал бы пирамиды ВНУТРЬ самого .tif, а нужен
+    именно отдельный файл .ovr.
+    """
     if not os.path.exists(raster_path):
         return False
+
     ovr_path = raster_path + ".ovr"
     if os.path.exists(ovr_path):
+        logger.info("Пирамиды уже есть: %s", os.path.basename(ovr_path))
         return True
 
-    logger.info("Строим пирамиды (gdaladdo): %s", os.path.basename(raster_path))
+    logger.info("Строим внешние пирамиды (.ovr): %s", os.path.basename(raster_path))
     start = time.time()
+
+    try:
+        with rasterio.open(raster_path) as src:
+            min_side = min(src.width, src.height)
+        # Уровни, на которых картинка ещё крупнее ~128 px -- мельче
+        # строить пирамиду бессмысленно.
+        factors = [f for f in (2, 4, 8, 16, 32, 64) if min_side // f >= 128] or [2]
+
+        with rasterio.Env(TIFF_USE_OVR=True, GDAL_TIFF_OVR_BLOCKSIZE="512", COMPRESS_OVERVIEW="ZSTD"):
+            with rasterio.open(raster_path, "r+") as dst:
+                dst.build_overviews(factors, Resampling.average)
+                dst.update_tags(ns="rio_overview", resampling="average")
+
+        if os.path.exists(ovr_path):
+            size_mb = os.path.getsize(ovr_path) / (1024 * 1024)
+            logger.info(
+                "Пирамиды построены за %.1f сек -> %s (%.1f МБ, уровни: %s)",
+                time.time() - start, os.path.basename(ovr_path), size_mb, factors,
+            )
+            return True
+
+        logger.warning(
+            "Файл .ovr не появился -- пирамиды, похоже, записались внутрь .tif. "
+            "Пробую запасной путь через gdaladdo, если он есть в системе."
+        )
+        return _build_pyramids_gdaladdo(raster_path, factors)
+
+    except Exception as e:  # noqa: BLE001
+        logger.error("Ошибка создания пирамид через rasterio: %s", e)
+        return _build_pyramids_gdaladdo(raster_path)
+
+
+def _build_pyramids_gdaladdo(raster_path: str, factors=None) -> bool:
+    """Запасной путь: внешняя утилита gdaladdo, ЕСЛИ она есть в системе.
+    На раннерах GitHub её обычно нет (пакет gdal-bin не ставится), поэтому
+    это просто подстраховка для локальных запусков -- сама по себе она
+    ничего не устанавливает и не может подвиснуть на apt-get."""
+    if shutil.which("gdaladdo") is None:
+        logger.error("gdaladdo не найден в системе -- пирамиды не построены")
+        return False
+
+    levels = " ".join(str(f) for f in (factors or (2, 4, 8, 16, 32, 64)))
+    ovr_path = raster_path + ".ovr"
     try:
         subprocess.run(
-            f'gdaladdo -ro --config GDAL_TIFF_OVR_BLOCKSIZE 512 "{raster_path}" 2 4 8 16 32 64',
-            shell=True, check=True,
+            ["gdaladdo", "-ro", "--config", "GDAL_TIFF_OVR_BLOCKSIZE", "512", raster_path, *levels.split()],
+            check=True, timeout=1800,
         )
-        ok = os.path.exists(ovr_path)
-        logger.info("Пирамиды %s за %.1f сек", "созданы" if ok else "НЕ созданы", time.time() - start)
-        return ok
+        return os.path.exists(ovr_path)
     except Exception as e:  # noqa: BLE001
-        logger.error("Ошибка создания пирамид: %s", e)
+        logger.error("gdaladdo тоже не справился: %s", e)
         return False
