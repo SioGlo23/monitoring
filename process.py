@@ -247,6 +247,7 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
         storage.upload_file(mosaic_local_path, mosaic_blob, content_type="image/tiff")
         process_log.log_operation(zakaz, "Создание мозаики", mosaic_local_path, time.time() - start, "OK")
 
+    # Пирамиды -- ОТДЕЛЬНЫМ файлом .ovr рядом с мозаикой (как в ноутбуке)
     ovr_blob = f"{mosaic_blob}.ovr"
     if not storage.blob_exists(ovr_blob):
         start = time.time()
@@ -254,7 +255,9 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
             ovr_local = mosaic_local_path + ".ovr"
             if os.path.exists(ovr_local):
                 storage.upload_file(ovr_local, ovr_blob, content_type="application/octet-stream")
-            process_log.log_operation(zakaz, "Создание пирамид", mosaic_local_path, time.time() - start, "OK")
+                process_log.log_operation(zakaz, "Создание пирамид", ovr_local, time.time() - start, "OK")
+        else:
+            process_log.log_operation(zakaz, "Создание пирамид", None, time.time() - start, "ERROR")
 
     eb_zstd_blob = f"{config.EIGHTBIT_PREFIX}/{final_name}_8bit_ZSTD.tif"
     eb_jpeg_blob = f"{config.EIGHTBIT_PREFIX}/{final_name}_8bit_JPEG.tif"
