@@ -1,148 +1,174 @@
-"""
-Определяет, "созрела" ли зона интереса для запуска тяжёлого пайплайна
-обработки (скачивание -> композит -> мозаика -> вода -> 8-бит), и
-ставит задание в очередь на Google Drive (queue/pending/), откуда его
-заберёт process.py.
+"""Общие мелкие утилиты, переиспользуемые в нескольких модулях."""
+import re
+from datetime import datetime
 
-Критерии готовности:
-  S2      -- найдены ВСЕ тайлы из mrgs_tiles AOI. Если mrgs_tiles не
-             задан -- готовность по стабилизации числа сцен (как для
-             Landsat без pr_tile, см. ниже).
-  Landsat -- если задан pr_tile -- найдены ВСЕ тайлы из pr_tile;
-             если pr_tile не задан/пуст -- ЛЮБЫЕ найденные на AOI
-             сцены Landsat, как только их число не меняется
-             config.LANDSAT_STABILITY_CYCLES прогонов подряд.
-
-Гейт по облачности -- считается по метаданным самих сцен (поле
-cloud_cover). Если готово несколько сцен одного спутника -- берётся
-СРЕДНЕЕ АРИФМЕТИЧЕСКОЕ их облачности. Гейт независим для каждого
-спутника.
-
-ВАЖНО: эта функция сама НЕ отправляет письма -- только возвращает
-решения (evaluate_and_enqueue), а monitor.py сам решает, когда и как
-их обобщить в одно письмо за весь прогон детекции (см. monitor.py и
-notifier.notify_processing_summary).
-"""
-import logging
+import pytz
 
 import config
-import state_store
-import utils
 
-logger = logging.getLogger("s2monitor.readiness")
+_tz = pytz.timezone(config.TIMEZONE)
 
-
-def _found_tiles(kind: str, prods: list) -> set:
-    if kind == "s2":
-        found = {utils.extract_s2_tile(p.get("Name", "")) for p in prods}
-    else:
-        found = {p.get("PR") for p in prods}
-    found.discard(None)
-    return found
+_S2_TILE_RE = re.compile(r'_T(\d{2}[A-Z]{3})_')
 
 
-def _tiles_ready(kind: str, feat, prods, zakaz, date_str) -> bool:
-    """Готовность по списку тайлов в атрибуте области интереса.
-
-    Формат атрибута -- "2 (37UCB, 37UDB)": нужно не менее 2 тайлов, и
-    засчитываются ТОЛЬКО перечисленные в скобках. Старый формат
-    "37UCB, 37UDB" означает "нужны все перечисленные". Если атрибут
-    пуст -- ограничений нет, и готовность определяется стабилизацией
-    числа найденных сцен."""
-    raw = utils.tile_attribute(kind, feat)
-    min_count, expected = utils.parse_tile_spec(raw)
-
-    if expected:
-        matched = _found_tiles(kind, prods) & expected
-        ready = len(matched) >= min_count
-        logger.info(
-            "Заказ %s (%s): найдено %s из %s ожидаемых тайлов, нужно минимум %s -> %s",
-            zakaz, kind, len(matched), len(expected), min_count,
-            "готово" if ready else "ждём",
-        )
-        return ready
-
-    stable_cycles, count = state_store.update_stability_counter(kind, zakaz, date_str, len(prods))
-    return count > 0 and stable_cycles >= config.LANDSAT_STABILITY_CYCLES
+def now_local():
+    return datetime.now(_tz)
 
 
-def _s2_ready(feat, s2_prods, zakaz, date_str) -> bool:
-    return _tiles_ready("s2", feat, s2_prods, zakaz, date_str)
+def to_local_timestamp(iso_string: str) -> str:
+    if not iso_string:
+        return "Unknown"
+    dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+    return dt.astimezone(_tz).strftime("%Y%m%dT%H%M%S")
 
 
-def _landsat_ready(feat, landsat_prods, zakaz, date_str) -> bool:
-    return _tiles_ready("landsat", feat, landsat_prods, zakaz, date_str)
+def to_local_readable(iso_string: str) -> str:
+    """Дата+время в читаемом виде для писем/UI, например '2026-08-01 14:23:05'."""
+    if not iso_string:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+    except ValueError:
+        return "—"
+    return dt.astimezone(_tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _average_cloud(prods: list):
-    values = [p["cloud_cover"] for p in prods if isinstance(p.get("cloud_cover"), (int, float))]
-    if not values:
+def retry(fn, attempts: int = 3, delay_seconds: float = 2.0, logger=None, what: str = "operation"):
+    """Простой ретрай с линейной паузой для нестабильных внешних API."""
+    import time
+
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - хотим ловить любые сетевые сбои
+            last_exc = exc
+            if logger:
+                logger.warning("Попытка %s/%s для %s не удалась: %s", attempt, attempts, what, exc)
+            if attempt < attempts:
+                time.sleep(delay_seconds * attempt)
+    raise last_exc
+
+
+def parse_tile_list(raw) -> set:
+    """'41VPD, 42VUJ' или ['41VPD','42VUJ'] -> {'41VPD','42VUJ'}. Пусто/None -> set().
+    Скобки и ведущее число (см. parse_tile_spec) отбрасываются."""
+    return parse_tile_spec(raw)[1]
+
+
+_TILE_SPEC_RE = re.compile(r"^\s*(\d+)?\s*\((.*)\)\s*$", re.DOTALL)
+
+
+def parse_tile_spec(raw):
+    """Разбирает значение атрибута mrgs_tiles / landsat_grid.
+
+    Поддерживаются два формата:
+
+      "2 (37UCB, 37UDB)"   -- нужно НЕ МЕНЕЕ 2 тайлов из перечисленных;
+                              учитываются только тайлы из скобок
+      "37UCB, 37UDB"       -- старый формат: нужны ВСЕ перечисленные
+                              (эквивалент "2 (37UCB, 37UDB)")
+      "" / None            -- ограничений нет
+
+    Возвращает (min_count, tiles):
+      tiles     -- множество допустимых тайлов (пустое = без ограничений)
+      min_count -- сколько из них достаточно, чтобы начать загрузку
+                   (None, если список тайлов не задан)
+
+    min_count всегда в пределах 1..len(tiles): требовать больше тайлов,
+    чем перечислено, бессмысленно -- такое задание никогда бы не
+    запустилось.
+    """
+    if not raw:
+        return None, set()
+
+    if not isinstance(raw, str):
+        tiles = {str(p).strip() for p in raw if str(p).strip()}
+        return (len(tiles) if tiles else None), tiles
+
+    text = raw.strip()
+    if not text:
+        return None, set()
+
+    min_count = None
+    match = _TILE_SPEC_RE.match(text)
+    if match:
+        if match.group(1):
+            min_count = int(match.group(1))
+        text = match.group(2)
+
+    tiles = {p.strip() for p in text.split(",") if p.strip()}
+    if not tiles:
+        return None, set()
+
+    if min_count is None:
+        min_count = len(tiles)          # старый формат -- нужны все
+    min_count = max(1, min(min_count, len(tiles)))
+    return min_count, tiles
+
+
+def extract_s2_tile(name: str):
+    """'..._T41VPD_...' -> '41VPD'. Возвращает None, если тайл-код не найден."""
+    m = _S2_TILE_RE.search(name or "")
+    return m.group(1) if m else None
+
+
+def detect_landsat_number(display_id: str) -> str:
+    """Номер спутника Landsat — 4-й символ Product ID (например, 'LC09_L1TP_...' -> '9')."""
+    return display_id[3] if len(display_id) >= 4 else "?"
+
+
+def utm_crs_for_shape(shape_obj) -> str:
+    """UTM-зона EPSG-код по центру геометрии (аналог TYPE_CHOICE_CRS=1 в исходном ноутбуке)."""
+    minx, _, maxx, _ = shape_obj.bounds
+    center_lon = (minx + maxx) / 2
+    zone = int((center_lon + 180) / 6) + 1
+    return f"EPSG:326{zone:02d}" if center_lon >= 0 else f"EPSG:327{zone:02d}"
+
+
+def utm_crs_for_s2_tile(tile_code: str):
+    """UTM-зона по коду тайла Sentinel-2 ('41VPD' -> EPSG:32641).
+
+    Точнее, чем определение по центроиду: тайл ВСЕГДА задан в своей
+    UTM-зоне, а его центроид у краевых тайлов может попадать в соседнюю
+    зону. Буква после номера зоны -- широтный пояс: C..M -- южное
+    полушарие, N..X -- северное. Возвращает None, если код не разобран."""
+    if not tile_code or len(tile_code) < 3:
         return None
-    return round(sum(values) / len(values), 2)
+    try:
+        zone = int(tile_code[:2])
+    except ValueError:
+        return None
+    band = tile_code[2].upper()
+    if not ("C" <= band <= "X"):
+        return None
+    return f"EPSG:326{zone:02d}" if band >= "N" else f"EPSG:327{zone:02d}"
 
 
-def _enqueue(zakaz, date_str, satellite, products) -> None:
-    job = {
-        "zakaz": zakaz,
-        "date": date_str,
-        "satellite": satellite,
-        "products": [{"Name": p.get("Name"), "Id": p.get("Id")} for p in products],
-        "created_msk": utils.now_local().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    blob_path = f"{config.QUEUE_PENDING_PREFIX}/{zakaz}_{date_str}_{satellite}.json"
-    state_store.write_queue_job(blob_path, job)
-    state_store.set_processing_decision(zakaz, date_str, satellite, "queued")
+def compressed_profile(base_profile: dict, count: int, dtype: str = "uint16") -> dict:
+    """Единый профиль вывода: заданный dtype + сжатие ZSTD + тайлинг."""
+    profile = base_profile.copy()
+    profile.update(count=count, dtype=dtype, tiled=True, blockxsize=256, blockysize=256, BIGTIFF="YES")
+    profile.update(compress="ZSTD", zstd_level=9, predictor=2)
+    return profile
 
 
-def evaluate_and_enqueue(zakaz, feat, date_str, s2_prods, landsat_prods) -> dict:
-    """Возвращает {satellite: {"status", "is_new", "scenes", "avg_cloud"}}
-    для каждого спутника, у которого есть хоть какое-то решение (в очереди
-    сейчас, уже в очереди с прошлого раза, готово, или отбраковано по
-    облачности). is_new=True означает, что решение принято ИМЕННО на этом
-    прогоне -- monitor.py использует это, чтобы не слать письмо повторно
-    про то же самое решение на каждом следующем прогоне."""
-    decisions = {}
+def sorted_orders(orders):
+    """Номера заказов по возрастанию как числа ('2000' < '2293'), с
+    откатом на обычную сортировку строк, если номера не числовые."""
+    try:
+        return sorted(orders, key=lambda z: int(z))
+    except (TypeError, ValueError):
+        return sorted(orders, key=str)
 
-    candidates = (
-        ("S2", _s2_ready(feat, s2_prods, zakaz, date_str), s2_prods),
-        ("L89", _landsat_ready(feat, landsat_prods, zakaz, date_str), landsat_prods),
-    )
 
-    for satellite, ready, prods in candidates:
-        if not ready or not prods:
-            continue
+def tile_attribute(kind: str, feat: dict):
+    """Сырое значение атрибута со списком тайлов из свойств области интереса.
 
-        avg_cloud = _average_cloud(prods)
-        existing = state_store.get_processing_decision(zakaz, date_str, satellite)
-        if existing in ("queued", "done", "skipped_cloud"):
-            decisions[satellite] = {
-                "status": existing, "is_new": False, "scenes": len(prods), "avg_cloud": avg_cloud,
-            }
-            continue
-
-        if avg_cloud is None:
-            logger.warning(
-                "Заказ %s (%s): в метаданных сцен нет данных об облачности -- обрабатываем без гейта",
-                zakaz, satellite,
-            )
-        elif avg_cloud >= config.CLOUD_THRESHOLD_PERCENT:
-            state_store.set_processing_decision(zakaz, date_str, satellite, "skipped_cloud")
-            logger.info(
-                "Заказ %s (%s): пропущена обработка -- средняя облачность %.1f%% >= порога %.1f%%",
-                zakaz, satellite, avg_cloud, config.CLOUD_THRESHOLD_PERCENT,
-            )
-            decisions[satellite] = {
-                "status": "skipped_cloud", "is_new": True, "scenes": len(prods), "avg_cloud": avg_cloud,
-            }
-            continue
-
-        _enqueue(zakaz, date_str, satellite, prods)
-        logger.info(
-            "Заказ %s (%s): поставлен в очередь на обработку (%s сцен, средняя облачность %s%%)",
-            zakaz, satellite, len(prods), avg_cloud,
-        )
-        decisions[satellite] = {
-            "status": "queued", "is_new": True, "scenes": len(prods), "avg_cloud": avg_cloud,
-        }
-
-    return decisions
+    kind: 's2' -> mrgs_tiles, 'landsat' -> landsat_grid.
+    Для Landsat поддерживается и прежнее имя атрибута pr_tile -- чтобы
+    старые geojson продолжали работать без переделки."""
+    props = feat.get("properties", {}) or {}
+    if kind == "s2":
+        return props.get("mrgs_tiles")
+    return props.get("landsat_grid") or props.get("pr_tile")
