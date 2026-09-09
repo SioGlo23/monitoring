@@ -78,7 +78,7 @@ MODIS_MIN_DATA_FRACTION = float(os.environ.get("MODIS_MIN_DATA_FRACTION", "0.02"
 #
 # На Telegram это не влияет: там каждый подписчик сам выбирает
 # интересующие его заказы в меню бота.
-EMAIL_NOTIFY_ORDERS = ["2000", "2001"]
+EMAIL_NOTIFY_ORDERS = ["2001"]
 
 
 # --- Telegram-бот (опционально) ---
