@@ -28,14 +28,25 @@ _transform_to_utm = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always
 _transform_back = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True).transform
 
 
-def _is_empty(filepath: str, left_columns: int = 4) -> bool:
+def _data_fraction(filepath: str):
+    """Доля непустых пикселей в кадре (0..1) или None, если файл не читается.
+
+    Раньше здесь проверялись только 4 ЛЕВЫХ столбца: если они чёрные --
+    снимок считался пустым целиком. Но MODIS приходит полосами съёмки, и
+    у области интереса вполне может быть пустой левый край при данных в
+    центре -- такой снимок ошибочно выбрасывался."""
     try:
         with rasterio.open(filepath) as src:
             data = src.read()
-            left_strip = data[:, :, :left_columns]
-            return bool(np.all(left_strip == 0))
-    except Exception:  # noqa: BLE001
-        return True
+        if data.size == 0:
+            return 0.0
+        # Пиксель считается непустым, если хоть в одном канале не ноль
+        nonzero = int((data.max(axis=0) > 0).sum())
+        total = int(data.shape[1]) * int(data.shape[2])
+        return nonzero / total if total else 0.0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MODIS: не удалось прочитать %s: %s", filepath, exc)
+        return None
 
 
 def download_for_aoi(zakaz, aoi_shape, date_str: str):
@@ -76,9 +87,17 @@ def download_for_aoi(zakaz, aoi_shape, date_str: str):
         with open(tmp_raw, "wb") as f:
             f.write(content)
 
-        if _is_empty(tmp_raw):
-            logger.info("MODIS для zakaz_%s пуст (нет данных на эту дату) -- пропускаем", zakaz)
+        fraction = _data_fraction(tmp_raw)
+        if fraction is None:
+            logger.info("MODIS для zakaz_%s: файл не читается -- пропускаем", zakaz)
             return None
+        if fraction < config.MODIS_MIN_DATA_FRACTION:
+            logger.info(
+                "MODIS для zakaz_%s: данных %.1f%% (порог %.1f%%) -- считаем пустым, пропускаем",
+                zakaz, fraction * 100, config.MODIS_MIN_DATA_FRACTION * 100,
+            )
+            return None
+        logger.info("MODIS для zakaz_%s: данных %.1f%% -- сохраняем", zakaz, fraction * 100)
 
         with rasterio.open(tmp_raw) as src:
             profile = src.profile.copy()
