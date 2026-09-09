@@ -78,8 +78,10 @@ def _fetch_quicklook(satellite: str, p: dict) -> dict:
     geo_local_path = os.path.join(quicklooks_dir, f"{p.get('Name')}_4326.png")
 
     try:
+        quicklook_geo_info = None
         if satellite == "S2":
-            if not s2_download.download_quicklook(p, local_path):
+            ok, quicklook_geo_info = s2_download.download_quicklook(p, local_path)
+            if not ok:
                 logger.info("Квиклук для %s (S2): не найден/не скачался", p.get("Name"))
                 return result
             blob_path = f"{config.QUICKLOOKS_PREFIX}/{p['Name']}.png"
@@ -115,7 +117,8 @@ def _fetch_quicklook(satellite: str, p: dict) -> dict:
             src_crs = utils.utm_crs_for_shape(shape(footprint))
 
         bounds = quicklook_geo.georeference_quicklook(
-            local_path, footprint, src_crs, geo_local_path, max_px=config.QUICKLOOK_MAX_PX
+            local_path, footprint, src_crs, geo_local_path,
+            max_px=config.QUICKLOOK_MAX_PX, geo_info=quicklook_geo_info,
         )
         if bounds:
             geo_blob = f"{config.QUICKLOOKS_GEO_PREFIX}/{p['Name']}_4326.png"
