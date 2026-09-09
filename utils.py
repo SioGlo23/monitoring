@@ -51,11 +51,60 @@ def retry(fn, attempts: int = 3, delay_seconds: float = 2.0, logger=None, what: 
 
 
 def parse_tile_list(raw) -> set:
-    """'41VPD, 42VUJ' или ['41VPD','42VUJ'] -> {'41VPD','42VUJ'}. Пусто/None -> set()."""
+    """'41VPD, 42VUJ' или ['41VPD','42VUJ'] -> {'41VPD','42VUJ'}. Пусто/None -> set().
+    Скобки и ведущее число (см. parse_tile_spec) отбрасываются."""
+    return parse_tile_spec(raw)[1]
+
+
+_TILE_SPEC_RE = re.compile(r"^\s*(\d+)?\s*\((.*)\)\s*$", re.DOTALL)
+
+
+def parse_tile_spec(raw):
+    """Разбирает значение атрибута mrgs_tiles / landsat_grid.
+
+    Поддерживаются два формата:
+
+      "2 (37UCB, 37UDB)"   -- нужно НЕ МЕНЕЕ 2 тайлов из перечисленных;
+                              учитываются только тайлы из скобок
+      "37UCB, 37UDB"       -- старый формат: нужны ВСЕ перечисленные
+                              (эквивалент "2 (37UCB, 37UDB)")
+      "" / None            -- ограничений нет
+
+    Возвращает (min_count, tiles):
+      tiles     -- множество допустимых тайлов (пустое = без ограничений)
+      min_count -- сколько из них достаточно, чтобы начать загрузку
+                   (None, если список тайлов не задан)
+
+    min_count всегда в пределах 1..len(tiles): требовать больше тайлов,
+    чем перечислено, бессмысленно -- такое задание никогда бы не
+    запустилось.
+    """
     if not raw:
-        return set()
-    parts = raw.split(",") if isinstance(raw, str) else raw
-    return {str(p).strip() for p in parts if str(p).strip()}
+        return None, set()
+
+    if not isinstance(raw, str):
+        tiles = {str(p).strip() for p in raw if str(p).strip()}
+        return (len(tiles) if tiles else None), tiles
+
+    text = raw.strip()
+    if not text:
+        return None, set()
+
+    min_count = None
+    match = _TILE_SPEC_RE.match(text)
+    if match:
+        if match.group(1):
+            min_count = int(match.group(1))
+        text = match.group(2)
+
+    tiles = {p.strip() for p in text.split(",") if p.strip()}
+    if not tiles:
+        return None, set()
+
+    if min_count is None:
+        min_count = len(tiles)          # старый формат -- нужны все
+    min_count = max(1, min(min_count, len(tiles)))
+    return min_count, tiles
 
 
 def extract_s2_tile(name: str):
@@ -102,3 +151,24 @@ def compressed_profile(base_profile: dict, count: int, dtype: str = "uint16") ->
     profile.update(count=count, dtype=dtype, tiled=True, blockxsize=256, blockysize=256, BIGTIFF="YES")
     profile.update(compress="ZSTD", zstd_level=9, predictor=2)
     return profile
+
+
+def sorted_orders(orders):
+    """Номера заказов по возрастанию как числа ('2000' < '2293'), с
+    откатом на обычную сортировку строк, если номера не числовые."""
+    try:
+        return sorted(orders, key=lambda z: int(z))
+    except (TypeError, ValueError):
+        return sorted(orders, key=str)
+
+
+def tile_attribute(kind: str, feat: dict):
+    """Сырое значение атрибута со списком тайлов из свойств области интереса.
+
+    kind: 's2' -> mrgs_tiles, 'landsat' -> landsat_grid.
+    Для Landsat поддерживается и прежнее имя атрибута pr_tile -- чтобы
+    старые geojson продолжали работать без переделки."""
+    props = feat.get("properties", {}) or {}
+    if kind == "s2":
+        return props.get("mrgs_tiles")
+    return props.get("landsat_grid") or props.get("pr_tile")
