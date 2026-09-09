@@ -63,6 +63,41 @@ SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", SMTP_USER)
 
+# Минимальная доля непустых пикселей в снимке MODIS, при которой он
+# считается полезным (0.02 = 2%). Ниже -- снимок считается пустым, то
+# есть данных на эту дату для области ещё нет.
+# Раньше проверялись только 4 левых столбца кадра, из-за чего снимки с
+# пустым левым краем, но данными в центре, ошибочно отбрасывались.
+MODIS_MIN_DATA_FRACTION = float(os.environ.get("MODIS_MIN_DATA_FRACTION", "0.02"))
+
+
+# --- Кому и по каким заказам слать письма ---
+# Список заказов, по которым уходят уведомления НА ПОЧТУ.
+# ПУСТОЙ список = слать по всем заказам (поведение по умолчанию).
+# Пример: EMAIL_NOTIFY_ORDERS = ["2000", "2293"]
+#
+# На Telegram это не влияет: там каждый подписчик сам выбирает
+# интересующие его заказы в меню бота.
+EMAIL_NOTIFY_ORDERS = ["2000", "2001"]
+
+
+# --- Telegram-бот (опционально) ---
+# Если токен не задан -- бот просто не используется, почта работает как обычно.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# Кто имеет право пользоваться ботом: список Telegram user id через
+# запятую. ПУСТО = доступ открыт всем, кто нашёл бота -- на первое время
+# это удобно, но потом лучше ограничить (см. инструкцию: /whoami покажет
+# ваш id).
+TELEGRAM_ALLOWED_USERS = {
+    u.strip() for u in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()
+}
+
+# Сколько секунд один прогон бота слушает Telegram, прежде чем завершиться.
+# GitHub Actions не умеет держать процесс вечно, поэтому бот работает
+# короткими сессиями по расписанию (см. .github/workflows/telegram_bot.yml).
+TELEGRAM_POLL_SECONDS = int(os.environ.get("TELEGRAM_POLL_SECONDS", "240"))
+
 # --- Прочее ---
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")
 
