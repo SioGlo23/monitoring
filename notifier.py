@@ -7,7 +7,33 @@ from email.mime.text import MIMEText
 
 import config
 
+# Telegram -- опциональная часть. Если модуль ещё не загружен в
+# репозиторий или токен не задан, всё продолжает работать на одной
+# почте: заглушка молча проглатывает вызовы, пайплайн не ломается.
+try:
+    import telegram_notify as tg
+except Exception as _tg_import_error:  # noqa: BLE001
+    logging.getLogger("s2monitor.notifier").info(
+        "Telegram-уведомления отключены (%s) -- работает только почта", _tg_import_error
+    )
+
+    class _TelegramDisabled:
+        @staticmethod
+        def broadcast_by_order(*args, **kwargs):
+            return None
+
+    tg = _TelegramDisabled()
+
 logger = logging.getLogger("s2monitor.notifier")
+
+
+def _email_orders(zakazy):
+    """Оставляет только те заказы, по которым разрешено слать почту
+    (config.EMAIL_NOTIFY_ORDERS). Пустой список в конфиге = слать по всем."""
+    allowed = {str(z) for z in config.EMAIL_NOTIFY_ORDERS}
+    if not allowed:
+        return list(zakazy)
+    return [z for z in zakazy if str(z) in allowed]
 
 
 def _sorted_zakazy(keys):
@@ -40,13 +66,28 @@ def _send_email(subject: str, body: str) -> None:
         logger.error("Ошибка отправки письма (%s): %s", subject, exc)
 
 
+def _broadcast_new_scenes_tg(all_zakazy, current_s2: dict, current_landsat: dict, map_url) -> None:
+    """Рассылка про новые сцены в Telegram -- по ВСЕМ заказам: кому что
+    показывать, решает выбор самого подписчика в меню бота, а не
+    config.EMAIL_NOTIFY_ORDERS (тот управляет только почтой)."""
+    tg_lines = {}
+    for zakaz in all_zakazy:
+        lines = [_format_line(p, "S2") for p in current_s2.get(zakaz, []) if p.get("is_new")]
+        lines += [_format_line(p, "Landsat") for p in current_landsat.get(zakaz, []) if p.get("is_new")]
+        if lines:
+            tg_lines[str(zakaz)] = lines
+    tg.broadcast_by_order("НОВЫЕ СНИМКИ", tg_lines,
+                          footer=f"Карта: {map_url}" if map_url else None)
+
+
 def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
     all_zakazy = _sorted_zakazy(set(current_s2.keys()) | set(current_landsat.keys()))
+    email_zakazy = _email_orders(all_zakazy)
 
     new_block, old_block = [], []
     zakazy_with_new = 0
 
-    for zakaz in all_zakazy:
+    for zakaz in email_zakazy:
         s2_list = current_s2.get(zakaz, [])
         l_list = current_landsat.get(zakaz, [])
 
@@ -71,6 +112,7 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
             old_block += [_format_line(p, "Landsat") for p in l_old]
 
     if not new_block:
+        _broadcast_new_scenes_tg(all_zakazy, current_s2, current_landsat, map_url)
         return
 
     body_parts = ["НОВЫЕ СНИМКИ:", ""] + new_block
@@ -80,6 +122,10 @@ def notify_new_scenes(current_s2: dict, current_landsat: dict, map_url) -> None:
         body_parts += ["", f"Карта (полные данные по каждой сцене): {map_url}"]
 
     _send_email(f"Новые сцены S2/Landsat -- {zakazy_with_new} заказ(ов)", "\n".join(body_parts))
+
+    # В Telegram уходит только про НОВЫЕ сцены и только по тем заказам,
+    # на которые подписан конкретный получатель.
+    _broadcast_new_scenes_tg(all_zakazy, current_s2, current_landsat, map_url)
 
 
 _STATUS_RU = {
@@ -112,18 +158,20 @@ def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decis
 
     lines = []
 
-    if newly_queued:
+    email_allowed = set(_email_orders({str(q[0]) for q in newly_queued} | {str(s[0]) for s in newly_skipped}))
+
+    if newly_queued and email_allowed:
         lines.append("ОТПРАВЛЕНО НА ЗАГРУЗКУ:")
         lines.append("")
-        for zakaz, satellite, scenes, avg_cloud in newly_queued:
+        for zakaz, satellite, scenes, avg_cloud in (q for q in newly_queued if str(q[0]) in email_allowed):
             cloud_str = f"{avg_cloud}%" if avg_cloud is not None else "неизвестна"
             lines.append(f"  • Заказ {zakaz} / {satellite}: {scenes} сцен, средняя облачность {cloud_str}")
         lines.append("")
 
-    if newly_skipped:
+    if newly_skipped and email_allowed:
         lines.append("ОТБРАКОВАНО ПО ОБЛАЧНОСТИ:")
         lines.append("")
-        for zakaz, satellite, avg_cloud in newly_skipped:
+        for zakaz, satellite, avg_cloud in (k for k in newly_skipped if str(k[0]) in email_allowed):
             lines.append(f"  • Заказ {zakaz} / {satellite}: средняя облачность {avg_cloud}% (порог {config.CLOUD_THRESHOLD_PERCENT}%)")
         lines.append("")
 
@@ -135,7 +183,20 @@ def notify_processing_summary(newly_queued: list, newly_skipped: list, all_decis
         lines.append("")
         lines += context_lines
 
-    _send_email("Обработка снимков -- изменения в очереди", "\n".join(lines))
+    if email_allowed:
+        _send_email("Обработка снимков -- изменения в очереди", "\n".join(lines))
+
+    tg_lines = {}
+    for zakaz, satellite, scenes, avg_cloud in newly_queued:
+        cloud_str = f"{avg_cloud}%" if avg_cloud is not None else "неизвестна"
+        tg_lines.setdefault(str(zakaz), []).append(
+            f"  • {satellite}: отправлено на загрузку ({scenes} сцен, облачность {cloud_str})"
+        )
+    for zakaz, satellite, avg_cloud in newly_skipped:
+        tg_lines.setdefault(str(zakaz), []).append(
+            f"  • {satellite}: отбраковано по облачности ({avg_cloud}%, порог {config.CLOUD_THRESHOLD_PERCENT}%)"
+        )
+    tg.broadcast_by_order("ОБРАБОТКА СНИМКОВ", tg_lines)
 
 
 def notify_processing_done(zakaz, date_str, satellite, result: dict = None, all_decisions: dict = None) -> None:
@@ -155,7 +216,13 @@ def notify_processing_done(zakaz, date_str, satellite, result: dict = None, all_
             lines.append("")
             lines += context_lines
 
-    _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
+    if _email_orders([str(zakaz)]):
+        _send_email(f"[Готово] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
+
+    tg.broadcast_by_order(
+        "ЗАКАЗ ГОТОВ",
+        {str(zakaz): [f"  • {satellite}, дата {date_str}: мозаика, водная маска и 8-бит готовы на Google Drive"]},
+    )
 
 
 def notify_processing_failed(zakaz, date_str, satellite, error: str, all_decisions: dict = None) -> None:
@@ -173,4 +240,10 @@ def notify_processing_failed(zakaz, date_str, satellite, error: str, all_decisio
             lines.append("")
             lines += context_lines
 
-    _send_email(f"[Ошибка обработки] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
+    if _email_orders([str(zakaz)]):
+        _send_email(f"[Ошибка обработки] Заказ {zakaz} / {satellite} / {date_str}", "\n".join(lines))
+
+    tg.broadcast_by_order(
+        "ОШИБКА ОБРАБОТКИ",
+        {str(zakaz): [f"  • {satellite}, дата {date_str}", f"    {error}"]},
+    )
