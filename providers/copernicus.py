@@ -82,7 +82,10 @@ def query_for_aoi(zakaz, feat, access_token: str, today_start: str, tomorrow: st
     products = utils.retry(_do_request, attempts=3, delay_seconds=3, logger=logger, what=f"S2 query (заказ {zakaz})")
     logger.info("Заказ %s: получено от CDSE %s сырых продуктов", zakaz, len(products))
 
-    mrgs_tiles = utils.parse_tile_list(feat.get("properties", {}).get("mrgs_tiles"))
+    # Формат атрибута -- "2 (37UCB, 37UDB)" либо старый "37UCB, 37UDB".
+    # Здесь важен только СПИСОК допустимых тайлов; сколько их нужно
+    # для запуска загрузки -- решает readiness.py.
+    _, mrgs_tiles = utils.parse_tile_spec(utils.tile_attribute("s2", feat))
 
     after_geo = 0
     filtered = []
