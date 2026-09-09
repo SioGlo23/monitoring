@@ -1,183 +1,148 @@
 """
-Конфигурация сервиса. Всё берётся из переменных окружения (в GitHub
-Actions -- из Secrets) -- никаких паролей и токенов в коде.
+Определяет, "созрела" ли зона интереса для запуска тяжёлого пайплайна
+обработки (скачивание -> композит -> мозаика -> вода -> 8-бит), и
+ставит задание в очередь на Google Drive (queue/pending/), откуда его
+заберёт process.py.
+
+Критерии готовности:
+  S2      -- найдены ВСЕ тайлы из mrgs_tiles AOI. Если mrgs_tiles не
+             задан -- готовность по стабилизации числа сцен (как для
+             Landsat без pr_tile, см. ниже).
+  Landsat -- если задан pr_tile -- найдены ВСЕ тайлы из pr_tile;
+             если pr_tile не задан/пуст -- ЛЮБЫЕ найденные на AOI
+             сцены Landsat, как только их число не меняется
+             config.LANDSAT_STABILITY_CYCLES прогонов подряд.
+
+Гейт по облачности -- считается по метаданным самих сцен (поле
+cloud_cover). Если готово несколько сцен одного спутника -- берётся
+СРЕДНЕЕ АРИФМЕТИЧЕСКОЕ их облачности. Гейт независим для каждого
+спутника.
+
+ВАЖНО: эта функция сама НЕ отправляет письма -- только возвращает
+решения (evaluate_and_enqueue), а monitor.py сам решает, когда и как
+их обобщить в одно письмо за весь прогон детекции (см. monitor.py и
+notifier.notify_processing_summary).
 """
-import os
-from datetime import date
+import logging
+
+import config
+import state_store
+import utils
+
+logger = logging.getLogger("s2monitor.readiness")
 
 
-def _require(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"Не задана обязательная переменная окружения: {name}")
-    return value
+def _found_tiles(kind: str, prods: list) -> set:
+    if kind == "s2":
+        found = {utils.extract_s2_tile(p.get("Name", "")) for p in prods}
+    else:
+        found = {p.get("PR") for p in prods}
+    found.discard(None)
+    return found
 
 
-# --- Copernicus Dataspace (Sentinel-2) ---
-COPERNICUS_USERNAME = _require("COPERNICUS_USERNAME")
-COPERNICUS_PASSWORD = _require("COPERNICUS_PASSWORD")
+def _tiles_ready(kind: str, feat, prods, zakaz, date_str) -> bool:
+    """Готовность по списку тайлов в атрибуте области интереса.
 
-# --- USGS M2M + EarthExplorer (Landsat). Один и тот же аккаунт ERS
-# используется и для поиска сцен (M2M API), и для скачивания файлов
-# (веб-сессия earthexplorer.usgs.gov) -- как в исходном ноутбуке. ---
-M2M_USERNAME = os.environ.get("M2M_USERNAME")
-M2M_PASSWORD = os.environ.get("M2M_PASSWORD")
-M2M_TOKEN = os.environ.get("M2M_TOKEN")  # опционально, запасной способ входа в M2M API
+    Формат атрибута -- "2 (37UCB, 37UDB)": нужно не менее 2 тайлов, и
+    засчитываются ТОЛЬКО перечисленные в скобках. Старый формат
+    "37UCB, 37UDB" означает "нужны все перечисленные". Если атрибут
+    пуст -- ограничений нет, и готовность определяется стабилизацией
+    числа найденных сцен."""
+    raw = utils.tile_attribute(kind, feat)
+    min_count, expected = utils.parse_tile_spec(raw)
 
-# --- Google Drive (замена Google Cloud Storage) ---
-DRIVE_CLIENT_ID = _require("DRIVE_CLIENT_ID")
-DRIVE_CLIENT_SECRET = _require("DRIVE_CLIENT_SECRET")
-DRIVE_REFRESH_TOKEN = _require("DRIVE_REFRESH_TOKEN")
-DRIVE_ROOT_FOLDER_ID = _require("DRIVE_ROOT_FOLDER_ID")
+    if expected:
+        matched = _found_tiles(kind, prods) & expected
+        ready = len(matched) >= min_count
+        logger.info(
+            "Заказ %s (%s): найдено %s из %s ожидаемых тайлов, нужно минимум %s -> %s",
+            zakaz, kind, len(matched), len(expected), min_count,
+            "готово" if ready else "ждём",
+        )
+        return ready
 
-# Пути ВНУТРИ корневой папки на Диске до входных данных.
-AOI_GEOJSON_BLOB = os.environ.get("AOI_GEOJSON_BLOB", "config/All_ROI_2026_2.geojson")
-GRID_GEOJSON_BLOB = os.environ.get("GRID_GEOJSON_BLOB", "config/GRID_Landsat.geojson")
-
-# Подпапки для выходных данных внутри корневой папки на Диске
-MODIS_PREFIX = os.environ.get("MODIS_PREFIX", "modis")
-LOGS_PREFIX = os.environ.get("LOGS_PREFIX", "logs")
-# Логи ТЯЖЁЛОЙ обработки (process.py) -- отдельно от логов мониторинга
-# (detection-циклов), чтобы не смешивались. Формат такой же, как
-# log_operation()/log_history в +S2_L89.ipynb.
-PROCESS_LOGS_PREFIX = os.environ.get("PROCESS_LOGS_PREFIX", "logs_process")
-STATE_BLOB = os.environ.get("STATE_BLOB", "state/previous_state.json")
-
-MOSAICS_PREFIX = os.environ.get("MOSAICS_PREFIX", "Мозаики")
-WATER_PREFIX = os.environ.get("WATER_PREFIX", "Мозаики/Water")
-EIGHTBIT_PREFIX = os.environ.get("EIGHTBIT_PREFIX", "Мозаики/8bit")
-
-# Промежуточные артефакты -- имена ПАПОК подобраны так, чтобы точно
-# совпадать с +S2_L89.ipynb: если DRIVE_ROOT_FOLDER_ID указывает на ту
-# же папку "S2" на Диске, что использует ноутбук, всё это ляжет ровно
-# туда же, рядом с ROIs/, ZIP/, bands/, Composites/, Мозаики/, logs/.
-BANDS_PREFIX = os.environ.get("BANDS_PREFIX", "bands")
-ZIP_PREFIX = os.environ.get("ZIP_PREFIX", "ZIP")
-COMPOSITES_PREFIX = os.environ.get("COMPOSITES_PREFIX", "Composites")
-
-QUEUE_PENDING_PREFIX = os.environ.get("QUEUE_PENDING_PREFIX", "queue/pending")
-QUEUE_DONE_PREFIX = os.environ.get("QUEUE_DONE_PREFIX", "queue/done")
-
-# --- Уведомления по почте (Gmail SMTP с app password) ---
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD")
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", SMTP_USER)
-
-# --- Кому и по каким заказам слать письма ---
-# Список заказов, по которым уходят уведомления НА ПОЧТУ.
-# ПУСТОЙ список = слать по всем заказам (поведение по умолчанию).
-# Пример: EMAIL_NOTIFY_ORDERS = ["2000", "2293"]
-#
-# На Telegram это не влияет: там каждый подписчик сам выбирает
-# интересующие его заказы в меню бота.
-EMAIL_NOTIFY_ORDERS = []
+    stable_cycles, count = state_store.update_stability_counter(kind, zakaz, date_str, len(prods))
+    return count > 0 and stable_cycles >= config.LANDSAT_STABILITY_CYCLES
 
 
-# --- Telegram-бот (опционально) ---
-# Если токен не задан -- бот просто не используется, почта работает как обычно.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
-# Кто имеет право пользоваться ботом: список Telegram user id через
-# запятую. ПУСТО = доступ открыт всем, кто нашёл бота -- на первое время
-# это удобно, но потом лучше ограничить (см. инструкцию: /whoami покажет
-# ваш id).
-TELEGRAM_ALLOWED_USERS = {
-    u.strip() for u in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()
-}
-
-# Сколько секунд один прогон бота слушает Telegram, прежде чем завершиться.
-# GitHub Actions не умеет держать процесс вечно, поэтому бот работает
-# короткими сессиями по расписанию (см. .github/workflows/telegram_bot.yml).
-TELEGRAM_POLL_SECONDS = int(os.environ.get("TELEGRAM_POLL_SECONDS", "240"))
-
-# --- Прочее ---
-TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")
-
-# Дата мониторинга: по умолчанию -- сегодня, можно переопределить
-# переменной окружения (удобно для ручного теста конкретного дня)
-MONITOR_DATE = os.environ.get("MONITOR_DATE") or date.today().isoformat()
-
-# Сколько зон интереса обрабатывать параллельно за один прогон детекции
-MAX_PARALLEL_AOI = int(os.environ.get("MAX_PARALLEL_AOI", "8"))
-
-LOCAL_TMP_DIR = "/tmp/s2_monitor"
-
-# ============================== ГОТОВНОСТЬ / ОБРАБОТКА (новое) ==============================
-
-# Каналы, которые собираются в композит/мозаику -- единый набор для всего
-# сервиса (как переменная `channels` в ноутбуке). Можно переопределить
-# переменной окружения CHANNELS без правки кода.
-CHANNELS = os.environ.get("CHANNELS", "SWIRNR")
-
-CHANNELS_DICT = {
-    "S2": {
-        "RGB": ["B04", "B03", "B02"],
-        "RGBN": ["B04", "B03", "B02", "B08"],
-        "RGBNSWIR": ["B04", "B03", "B02", "B08", "B12"],
-        "SWIRNR": ["B12", "B08", "B04"],
-    },
-    "L89": {
-        "RGB": ["B4", "B3", "B2"],
-        "RGBN": ["B4", "B3", "B2", "B5"],
-        "RGBNSWIR": ["B4", "B3", "B2", "B5", "B7"],
-        "SWIRNR": ["B7", "B5", "B4"],
-    },
-}
-PAN_BAND_L89 = "B8"
-PANSHARPEN_BLOCK_SIZE = int(os.environ.get("PANSHARPEN_BLOCK_SIZE", "2048"))
+def _s2_ready(feat, s2_prods, zakaz, date_str) -> bool:
+    return _tiles_ready("s2", feat, s2_prods, zakaz, date_str)
 
 
-def selected_bands(satellite: str) -> list:
-    return CHANNELS_DICT[satellite].get(CHANNELS, CHANNELS_DICT[satellite]["RGB"])
+def _landsat_ready(feat, landsat_prods, zakaz, date_str) -> bool:
+    return _tiles_ready("landsat", feat, landsat_prods, zakaz, date_str)
 
 
-# Пороги воды и min/max для 8-бит -- свои для каждого спутника (см. v2 ноутбука)
-WATER_THRESHOLDS = {
-    "S2": {"porog1": 1500, "porog2": 1800, "ch1": 1, "ch2": 2},
-    "L89": {"porog1": 5500, "porog2": 8500, "ch1": 1, "ch2": 2},
-}
-EIGHTBIT_MINMAX = {
-    "S2": {"min_val": 1000, "max_val": 5000},
-    "L89": {"min_val": 5000, "max_val": 23000},
-}
+def _average_cloud(prods: list):
+    values = [p["cloud_cover"] for p in prods if isinstance(p.get("cloud_cover"), (int, float))]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
 
-# Параметры формы водной маски (сглаживание/упрощение контура,
-# минимальная площадь объекта/отверстия) -- единые для обоих спутников.
-# Все "магические числа" пайплайна собраны здесь, в одном файле.
-WATER_SHAPE_PARAMS = {
-    "min_area_m2": float(os.environ.get("WATER_MIN_AREA_M2", "20000")),
-    "min_hole_area_m2": float(os.environ.get("WATER_MIN_HOLE_AREA_M2", "5000")),
-    "smooth_iterations": int(os.environ.get("WATER_SMOOTH_ITERATIONS", "1")),
-    "simplify_factor": float(os.environ.get("WATER_SIMPLIFY_FACTOR", "3.5")),
-}
 
-# Сколько прогонов подряд число найденных сцен должно НЕ меняться,
-# чтобы считать зону "созревшей" -- используется, когда явный список
-# ожидаемых тайлов (mrgs_tiles / pr_tile) не задан.
-LANDSAT_STABILITY_CYCLES = int(os.environ.get("LANDSAT_STABILITY_CYCLES", "2"))
+def _enqueue(zakaz, date_str, satellite, products) -> None:
+    job = {
+        "zakaz": zakaz,
+        "date": date_str,
+        "satellite": satellite,
+        "products": [{"Name": p.get("Name"), "Id": p.get("Id")} for p in products],
+        "created_msk": utils.now_local().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    blob_path = f"{config.QUEUE_PENDING_PREFIX}/{zakaz}_{date_str}_{satellite}.json"
+    state_store.write_queue_job(blob_path, job)
+    state_store.set_processing_decision(zakaz, date_str, satellite, "queued")
 
-# Порог средней облачности (%) по метаданным сцен -- выше этого значения
-# обработка НЕ запускается. Средняя считается по всем сценам, попавшим
-# в комплект по данному спутнику (для S2 -- по всем тайлам из mrgs_tiles,
-# для Landsat -- по всем найденным/из pr_tile).
-CLOUD_THRESHOLD_PERCENT = float(os.environ.get("CLOUD_THRESHOLD_PERCENT", "70"))
 
-# Куда сохранять квиклуки (загрубленные превью) новых сцен
-QUICKLOOKS_PREFIX = os.environ.get("QUICKLOOKS_PREFIX", "logs/quicklooks")
+def evaluate_and_enqueue(zakaz, feat, date_str, s2_prods, landsat_prods) -> dict:
+    """Возвращает {satellite: {"status", "is_new", "scenes", "avg_cloud"}}
+    для каждого спутника, у которого есть хоть какое-то решение (в очереди
+    сейчас, уже в очереди с прошлого раза, готово, или отбраковано по
+    облачности). is_new=True означает, что решение принято ИМЕННО на этом
+    прогоне -- monitor.py использует это, чтобы не слать письмо повторно
+    про то же самое решение на каждом следующем прогоне."""
+    decisions = {}
 
-# Куда сохранять ГЕОПРИВЯЗАННЫЕ квиклуки (перепроецированные в EPSG:4326
-# RGBA-PNG), которые кладутся слоем на карту.
-QUICKLOOKS_GEO_PREFIX = os.environ.get("QUICKLOOKS_GEO_PREFIX", "logs/quicklooks/geo")
+    candidates = (
+        ("S2", _s2_ready(feat, s2_prods, zakaz, date_str), s2_prods),
+        ("L89", _landsat_ready(feat, landsat_prods, zakaz, date_str), landsat_prods),
+    )
 
-# Ограничение размера геопривязанного квиклука по длинной стороне.
-# Картинки инлайнятся в HTML карты как base64, поэтому чем больше
-# размер -- тем тяжелее файл карты (512 px ~ 100-300 КБ на сцену).
-QUICKLOOK_MAX_PX = int(os.environ.get("QUICKLOOK_MAX_PX", "512"))
+    for satellite, ready, prods in candidates:
+        if not ready or not prods:
+            continue
 
-# Прозрачность слоя квиклуков на карте
-QUICKLOOK_OVERLAY_OPACITY = float(os.environ.get("QUICKLOOK_OVERLAY_OPACITY", "0.85"))
+        avg_cloud = _average_cloud(prods)
+        existing = state_store.get_processing_decision(zakaz, date_str, satellite)
+        if existing in ("queued", "done", "skipped_cloud"):
+            decisions[satellite] = {
+                "status": existing, "is_new": False, "scenes": len(prods), "avg_cloud": avg_cloud,
+            }
+            continue
 
-# Показывать ли слои квиклуков сразу при открытии карты. По умолчанию
-# выключено -- слои включаются галочкой, чтобы карта не загромождалась
-# и открывалась быстрее.
-QUICKLOOK_LAYERS_SHOW_BY_DEFAULT = os.environ.get("QUICKLOOK_LAYERS_SHOW", "").lower() in ("1", "true", "yes")
+        if avg_cloud is None:
+            logger.warning(
+                "Заказ %s (%s): в метаданных сцен нет данных об облачности -- обрабатываем без гейта",
+                zakaz, satellite,
+            )
+        elif avg_cloud >= config.CLOUD_THRESHOLD_PERCENT:
+            state_store.set_processing_decision(zakaz, date_str, satellite, "skipped_cloud")
+            logger.info(
+                "Заказ %s (%s): пропущена обработка -- средняя облачность %.1f%% >= порога %.1f%%",
+                zakaz, satellite, avg_cloud, config.CLOUD_THRESHOLD_PERCENT,
+            )
+            decisions[satellite] = {
+                "status": "skipped_cloud", "is_new": True, "scenes": len(prods), "avg_cloud": avg_cloud,
+            }
+            continue
+
+        _enqueue(zakaz, date_str, satellite, prods)
+        logger.info(
+            "Заказ %s (%s): поставлен в очередь на обработку (%s сцен, средняя облачность %s%%)",
+            zakaz, satellite, len(prods), avg_cloud,
+        )
+        decisions[satellite] = {
+            "status": "queued", "is_new": True, "scenes": len(prods), "avg_cloud": avg_cloud,
+        }
+
+    return decisions
