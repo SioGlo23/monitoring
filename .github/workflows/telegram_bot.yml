@@ -1,0 +1,60 @@
+name: Telegram Bot
+
+# У бота нет постоянного сервера, поэтому он работает короткими
+# сессиями: запускается по расписанию, несколько минут слушает Telegram
+# и завершается. Следующий запуск подхватывает всё, что накопилось.
+#
+# TELEGRAM_POLL_SECONDS (по умолчанию 240) задаёт длину одной сессии.
+# При cron раз в 5 минут и сессии 240 секунд бот отвечает почти
+# мгновенно. Если хочется экономнее -- уменьшите TELEGRAM_POLL_SECONDS
+# (например, до 60): бот будет отвечать с задержкой до нескольких минут,
+# но реже занимать раннер. На уведомления это НЕ влияет вообще -- их
+# рассылает monitor.py/process.py напрямую, а не этот workflow.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+# Два одновременных опроса Telegram недопустимы: API вернёт ошибку
+# конфликта (getUpdates можно вызывать только из одного места разом).
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Боту НЕ нужны тяжёлые гео-библиотеки (rasterio, geopandas и т.д.) --
+      # он только читает список заказов из geojson и общается с Telegram.
+      # Поэтому ставим только нужное: сессия стартует за секунды.
+      - name: Install dependencies
+        run: pip install requests pytz google-api-python-client google-auth google-auth-httplib2
+
+      - name: Run bot session
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_ALLOWED_USERS }}
+          TELEGRAM_POLL_SECONDS: "240"
+          DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          DRIVE_REFRESH_TOKEN: ${{ secrets.DRIVE_REFRESH_TOKEN }}
+          DRIVE_ROOT_FOLDER_ID: ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
+          # config.py требует эти переменные при импорте, хотя боту они
+          # не нужны -- передаём те же секреты, что и остальным workflow.
+          COPERNICUS_USERNAME: ${{ secrets.COPERNICUS_USERNAME }}
+          COPERNICUS_PASSWORD: ${{ secrets.COPERNICUS_PASSWORD }}
+          TIMEZONE: "Europe/Moscow"
+        run: python telegram_bot.py

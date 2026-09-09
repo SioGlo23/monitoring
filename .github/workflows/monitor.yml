@@ -19,11 +19,9 @@ concurrency:
   group: s2-monitor
   cancel-in-progress: false
 
-# ДОБАВЛЕНО: право actions:write нужно, чтобы monitor.py мог сам
-# запустить workflow "S2 Process" через GitHub API сразу же, как
-# только появляется задание на обработку — не дожидаясь расписания
-# process.yml. contents:read — дефолтное право на чтение репозитория,
-# оставлено явным, чтобы не полагаться на дефолты организации/репозитория.
+# Право actions:write нужно, чтобы monitor.py мог сам запустить workflow
+# "S2 Process" через GitHub API сразу же, как только появляется задание
+# на обработку — не дожидаясь расписания process.yml.
 permissions:
   contents: read
   actions: write
@@ -61,9 +59,11 @@ jobs:
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           TIMEZONE: "Europe/Moscow"
-          # ДОБАВЛЕНО: специальный токен, который GitHub Actions создаёт
-          # автоматически на каждый запуск (это не секрет, который нужно
-          # заводить самостоятельно) — monitor.py использует его, чтобы
-          # вызвать GitHub API и запустить workflow "S2 Process" немедленно.
+          # Специальный токен, который GitHub Actions создаёт автоматически
+          # на каждый запуск (заводить его самостоятельно не нужно) —
+          # monitor.py использует его, чтобы запустить "S2 Process".
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Токен Telegram-бота: без него уведомления в Telegram просто
+          # не отправляются, почта работает как обычно.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python monitor.py
