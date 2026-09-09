@@ -117,7 +117,9 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
     )
     logger.info("Заказ %s: получено от M2M %s сырых сцен", zakaz, len(results))
 
-    pr_tiles = utils.parse_tile_list(feat.get("properties", {}).get("pr_tile"))
+    # Атрибут landsat_grid (или прежний pr_tile) в формате
+    # "1 (179021, 178021)" либо старом "179021, 178021".
+    _, pr_tiles = utils.parse_tile_spec(utils.tile_attribute("landsat", feat))
 
     filtered = []
     seen_pr = set()
@@ -130,8 +132,8 @@ def query_for_aoi(zakaz, feat, session_id: str, target_date_str: str, grid_gdf: 
         if scene_pr in seen_pr or scene_pr not in grid_gdf["PR"].values:
             continue
 
-        # Если pr_tile задан в свойствах AOI -- берём только эти тайлы.
-        # Если не задан/пуст -- берём все, что пересекаются с AOI (как раньше).
+        # Если список тайлов задан -- берём только их. Если не задан/пуст --
+        # берём все, что пересекаются с AOI (как раньше).
         if pr_tiles and scene_pr not in pr_tiles:
             continue
 
