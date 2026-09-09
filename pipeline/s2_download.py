@@ -252,79 +252,47 @@ def _normalize_to_png(src_path: str, dst_path: str) -> bool:
         return False
 
 
-def _quicklook_via_assets(cdse: "_CdseSession", prod_id: str, out_path: str) -> bool:
-    """Официальный способ CDSE: у продукта есть отдельные Assets, среди
-    которых ассет типа QUICKLOOK. Надёжнее, чем искать превью внутри
-    SAFE-пакета -- не зависит от версии обработки и структуры пакета."""
-    url = f"{_CDSE_CATALOGUE_ODATA}/Products({prod_id})/Assets"
-    r = cdse._http_get(url)
-    if r is None:
-        logger.info("Квиклук (Assets): запрос не выполнен (сетевая ошибка)")
-        return False
-    if r.status_code != 200:
-        logger.info("Квиклук (Assets): HTTP %s", r.status_code)
-        r.close()
-        return False
+def _read_geo_info(path: str):
+    """Читает зашитую в файл геопривязку (проекция + аффинное
+    преобразование), если она есть.
+
+    Ради этого и стоит предпочитать PVI из SAFE-пакета: у него привязка
+    зашита внутри, и её можно взять как есть -- вместо того чтобы
+    угадывать положение картинки по контуру сцены. Именно угадывание и
+    давало кривую привязку у краевых тайлов: контур там охватывает
+    только фактические данные, а PVI покрывает тайл целиком."""
     try:
-        assets = r.json().get("value", [])
+        with rasterio.open(path) as src:
+            if src.crs and src.transform and not src.transform.is_identity:
+                t = src.transform
+                return {
+                    "crs": src.crs.to_string(),
+                    "transform": [t.a, t.b, t.c, t.d, t.e, t.f],
+                    "width": src.width,
+                    "height": src.height,
+                }
     except Exception as exc:  # noqa: BLE001
-        logger.info("Квиклук (Assets): не удалось разобрать ответ: %s", exc)
-        return False
-    finally:
-        r.close()
-
-    quicklooks = [a for a in assets if str(a.get("Type", "")).upper() == "QUICKLOOK"]
-    if not quicklooks:
-        types = sorted({str(a.get("Type")) for a in assets})
-        logger.info("Квиклук (Assets): ассета QUICKLOOK нет. Доступные типы: %s", types)
-        return False
-
-    asset = quicklooks[0]
-    download_link = asset.get("DownloadLink")
-    if not download_link and asset.get("Id"):
-        download_link = f"{_CDSE_CATALOGUE_ODATA}/Assets({asset['Id']})/$value"
-    if not download_link:
-        logger.info("Квиклук (Assets): у ассета QUICKLOOK нет ссылки на скачивание")
-        return False
-
-    tmp_path = out_path + ".asset"
-    rr = cdse._http_get(download_link, stream=True)
-    if rr is None or rr.status_code != 200:
-        logger.info("Квиклук (Assets): скачивание вернуло %s", getattr(rr, "status_code", "нет ответа"))
-        if rr is not None:
-            rr.close()
-        return False
-    try:
-        with rr, open(tmp_path, "wb") as f:
-            for chunk in rr.iter_content(chunk_size=1 << 16):
-                if chunk:
-                    f.write(chunk)
-        ok = _normalize_to_png(tmp_path, out_path)
-        if ok:
-            logger.info("Квиклук получен через Assets (%s КБ)", os.path.getsize(out_path) // 1024)
-        return ok
-    except Exception as exc:  # noqa: BLE001
-        logger.info("Квиклук (Assets): ошибка при скачивании: %s", exc)
-        return False
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        logger.info("Геопривязка в файле превью не прочитана: %s", exc)
+    return None
 
 
-def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, out_path: str) -> bool:
-    """Запасной способ: ищем превью прямо внутри SAFE-пакета по
-    manifest.safe. У Sentinel-2 это файл *_PVI.jp2 в GRANULE/.../QI_DATA/."""
+def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, out_path: str):
+    """Ищет превью прямо внутри SAFE-пакета по manifest.safe. У
+    Sentinel-2 это файл *_PVI.jp2 в GRANULE/.../QI_DATA/.
+
+    Возвращает (успех, geo_info). geo_info -- зашитая в PVI привязка либо
+    None."""
     manifest_path = out_path + ".manifest.safe"
     cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
     if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
         logger.info("Квиклук (manifest): не удалось скачать manifest.safe")
-        return False
+        return False, None
 
     try:
         root = ET.parse(manifest_path).getroot()
     except ET.ParseError as exc:
         logger.info("Квиклук (manifest): ошибка парсинга: %s", exc)
-        return False
+        return False, None
     finally:
         if os.path.exists(manifest_path):
             os.remove(manifest_path)
@@ -337,7 +305,7 @@ def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, 
         low = href.lower()
         if not low.endswith(_PREVIEW_IMAGE_EXTS):
             continue
-        # TCI -- это полноразмерное цветное изображение (сотни МБ), НЕ превью
+        # TCI -- полноразмерное цветное изображение (сотни МБ), не превью
         if "tci" in low:
             continue
         if any(pat in low for pat in _PREVIEW_NAME_PATTERNS) or "/preview/" in low:
@@ -345,10 +313,10 @@ def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, 
 
     if not candidates:
         logger.info("Квиклук (manifest): подходящих файлов превью (PVI/quick-look) не найдено")
-        return False
+        return False, None
 
-    # Уже веб-совместимые форматы -- в приоритете, конвертировать не придётся
-    candidates.sort(key=lambda h: 0 if h.lower().endswith((".png", ".jpg", ".jpeg")) else 1)
+    # PVI в приоритете: именно у него есть зашитая геопривязка
+    candidates.sort(key=lambda h: 0 if "_pvi." in h.lower() else 1)
     rel_path = candidates[0]
     logger.info("Квиклук (manifest): найден %s", rel_path)
 
@@ -356,28 +324,93 @@ def _quicklook_via_manifest(cdse: "_CdseSession", prod_id: str, safe_name: str, 
     tmp_path = out_path + os.path.splitext(rel_path)[1].lower()
     if not cdse.download_node_file(prod_id, parts, tmp_path):
         logger.info("Квиклук (manifest): файл найден, но скачать не удалось")
-        return False
+        return False, None
 
     try:
-        return _normalize_to_png(tmp_path, out_path)
+        geo = _read_geo_info(tmp_path)
+        if geo:
+            logger.info("Квиклук (manifest): взята зашитая привязка (%s, %sx%s)",
+                        geo["crs"], geo["width"], geo["height"])
+        else:
+            logger.info("Квиклук (manifest): привязки в файле нет -- будет привязка по контуру сцены")
+        ok = _normalize_to_png(tmp_path, out_path)
+        return ok, (geo if ok else None)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def download_quicklook(prod: dict, out_path: str) -> bool:
-    """Скачивает загрубленное превью (quicklook) сцены Sentinel-2 и
-    сохраняет его как PNG по пути out_path.
+def _quicklook_via_assets(cdse: "_CdseSession", prod_id: str, out_path: str):
+    """Запасной способ: у продукта в каталоге CDSE есть отдельный ассет
+    типа QUICKLOOK. Он всегда доступен, но это обычный JPEG БЕЗ
+    геопривязки -- поэтому используется только если PVI не достался."""
+    url = f"{_CDSE_CATALOGUE_ODATA}/Products({prod_id})/Assets"
+    r = cdse._http_get(url)
+    if r is None:
+        logger.info("Квиклук (Assets): запрос не выполнен (сетевая ошибка)")
+        return False, None
+    if r.status_code != 200:
+        logger.info("Квиклук (Assets): HTTP %s", r.status_code)
+        r.close()
+        return False, None
+    try:
+        assets = r.json().get("value", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Квиклук (Assets): не удалось разобрать ответ: %s", exc)
+        return False, None
+    finally:
+        r.close()
 
-    Пробует два способа по очереди:
-      1. Эндпоинт Assets в CDSE (ассет типа QUICKLOOK) -- официальный
-         способ, не зависит от структуры SAFE-пакета;
-      2. Поиск внутри SAFE по manifest.safe -- файл *_PVI.jp2 в
-         GRANULE/.../QI_DATA/ (у Sentinel-2 превью называется PVI и лежит
-         именно там, а НЕ в папке "preview" -- это структура Sentinel-1).
+    quicklooks = [a for a in assets if str(a.get("Type", "")).upper() == "QUICKLOOK"]
+    if not quicklooks:
+        types = sorted({str(a.get("Type")) for a in assets})
+        logger.info("Квиклук (Assets): ассета QUICKLOOK нет. Доступные типы: %s", types)
+        return False, None
 
-    Возвращает False (не бросает исключение) при любой неудаче -- квиклук
-    вспомогательная функция, её отсутствие не должно ронять детекцию."""
+    asset = quicklooks[0]
+    download_link = asset.get("DownloadLink")
+    if not download_link and asset.get("Id"):
+        download_link = f"{_CDSE_CATALOGUE_ODATA}/Assets({asset['Id']})/$value"
+    if not download_link:
+        logger.info("Квиклук (Assets): у ассета QUICKLOOK нет ссылки на скачивание")
+        return False, None
+
+    tmp_path = out_path + ".asset"
+    rr = cdse._http_get(download_link, stream=True)
+    if rr is None or rr.status_code != 200:
+        logger.info("Квиклук (Assets): скачивание вернуло %s", getattr(rr, "status_code", "нет ответа"))
+        if rr is not None:
+            rr.close()
+        return False, None
+    try:
+        with rr, open(tmp_path, "wb") as f:
+            for chunk in rr.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    f.write(chunk)
+        geo = _read_geo_info(tmp_path)
+        ok = _normalize_to_png(tmp_path, out_path)
+        if ok:
+            logger.info("Квиклук получен через Assets (%s КБ)", os.path.getsize(out_path) // 1024)
+        return ok, (geo if ok else None)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Квиклук (Assets): ошибка при скачивании: %s", exc)
+        return False, None
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def download_quicklook(prod: dict, out_path: str):
+    """Скачивает превью сцены Sentinel-2 и сохраняет его как PNG.
+
+    Порядок способов важен: СНАЧАЛА PVI из SAFE-пакета (у него зашита
+    точная геопривязка), и только потом ассет QUICKLOOK из каталога
+    (обычный JPEG без привязки). Раньше порядок был обратный -- из-за
+    этого привязка считалась по контуру сцены и у краевых тайлов
+    получалась смещённой.
+
+    Возвращает (успех, geo_info); geo_info может быть None -- тогда
+    привязку придётся считать по контуру сцены."""
     prod_name = prod["Name"]
     prod_id = prod["Id"]
     safe_name = prod_name if prod_name.endswith(".SAFE") else f"{prod_name}.SAFE"
@@ -385,15 +418,17 @@ def download_quicklook(prod: dict, out_path: str) -> bool:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     cdse = _CdseSession()
 
-    if _quicklook_via_assets(cdse, prod_id, out_path):
-        return True
+    ok, geo = _quicklook_via_manifest(cdse, prod_id, safe_name, out_path)
+    if ok:
+        return True, geo
 
-    logger.info("Квиклук %s: Assets не сработал, пробую через manifest.safe", prod_name[:45])
-    if _quicklook_via_manifest(cdse, prod_id, safe_name, out_path):
-        return True
+    logger.info("Квиклук %s: PVI не достался, пробую ассет QUICKLOOK", prod_name[:45])
+    ok, geo = _quicklook_via_assets(cdse, prod_id, out_path)
+    if ok:
+        return True, geo
 
     logger.warning("Квиклук %s: не удалось получить ни одним способом", prod_name[:45])
-    return False
+    return False, None
 
 
 def create_composite_from_bands(bands_path: str, selected_bands: list, output_path: str) -> str:
