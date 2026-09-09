@@ -22,6 +22,7 @@ import logging
 import geopandas as gpd
 import numpy as np
 import rasterio.features
+from affine import Affine
 from PIL import Image
 from rasterio.transform import array_bounds, from_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
@@ -37,16 +38,26 @@ _BLACK_THRESHOLD = 4
 
 
 def georeference_quicklook(src_png: str, footprint_geojson: dict, src_crs: str,
-                            dst_png: str, max_px: int = 512):
+                            dst_png: str, max_px: int = 512, geo_info: dict = None):
     """Привязывает квиклук и перепроецирует его в EPSG:4326.
 
-    src_png       -- исходный квиклук (обычный PNG/JPEG без геопривязки)
+    src_png       -- исходный квиклук (PNG)
     footprint_geojson -- контур сцены (GeoJSON geometry, EPSG:4326)
-    src_crs       -- проекция, в которой квиклук north-up (обычно UTM сцены)
+    src_crs       -- запасная проекция, если точной привязки нет
     dst_png       -- куда сохранить результат (RGBA PNG в EPSG:4326)
     max_px        -- ограничение размера по длинной стороне: карта
                      встраивает картинки в HTML как base64, поэтому
                      большие изображения раздувают файл карты
+    geo_info      -- ТОЧНАЯ привязка, вычитанная из исходного файла
+                     превью (см. s2_download._read_geo_info). Если
+                     задана -- используется она, и это самый надёжный
+                     вариант.
+
+    Если точной привязки нет, положение картинки оценивается по bbox
+    контура сцены. Это работает, только когда превью покрывает ровно
+    тот же прямоугольник, что и контур. У краевых тайлов Sentinel-2 это
+    НЕ так (контур охватывает лишь фактические данные, а превью -- весь
+    тайл), поэтому там привязка получается приблизительной.
 
     Возвращает bounds для folium ([[south, west], [north, east]]) либо
     None, если привязать не удалось.
@@ -66,7 +77,20 @@ def georeference_quicklook(src_png: str, footprint_geojson: dict, src_crs: str,
     rgb = np.moveaxis(np.array(img), -1, 0)  # (3, H, W)
     height, width = rgb.shape[1], rgb.shape[2]
 
-    # --- контур сцены в проекции квиклука ---
+    if geo_info:
+        # ТОЧНЫЙ путь: привязка взята из самого файла превью.
+        src_crs = geo_info["crs"]
+        base = Affine(*geo_info["transform"])
+        # Картинку мы могли уменьшить -- значит, пиксель стал крупнее
+        # ровно во столько же раз, и преобразование нужно масштабировать.
+        scale_x = geo_info["width"] / width
+        scale_y = geo_info["height"] / height
+        src_transform = base * Affine.scale(scale_x, scale_y)
+        logger.info("Геопривязка: используется точная привязка из файла превью (%s)", src_crs)
+    else:
+        logger.info("Геопривязка: точной привязки нет -- оцениваю по контуру сцены (%s)", src_crs)
+
+    # --- контур сцены в проекции квиклука (нужен для маски прозрачности) ---
     try:
         fp_4326 = shape(footprint_geojson)
         fp_proj = gpd.GeoSeries([fp_4326], crs="EPSG:4326").to_crs(src_crs).iloc[0]
@@ -79,8 +103,9 @@ def georeference_quicklook(src_png: str, footprint_geojson: dict, src_crs: str,
         logger.warning("Геопривязка: некорректный bbox контура %s", (minx, miny, maxx, maxy))
         return None
 
-    # Квиклук north-up и покрывает ровно bbox сцены в её проекции
-    src_transform = from_bounds(minx, miny, maxx, maxy, width, height)
+    if not geo_info:
+        # Запасной путь: считаем, что превью north-up и покрывает bbox контура
+        src_transform = from_bounds(minx, miny, maxx, maxy, width, height)
 
     # --- альфа: прозрачно вне контура и на чёрной рамке ---
     inside = rasterio.features.geometry_mask(
@@ -91,9 +116,15 @@ def georeference_quicklook(src_png: str, footprint_geojson: dict, src_crs: str,
 
     # --- перепроецирование в EPSG:4326 ---
     dst_crs = "EPSG:4326"
+    # Границы источника берём из фактического преобразования картинки, а
+    # не из bbox контура: при точной привязке это разные вещи.
+    src_left, src_top = src_transform * (0, 0)
+    src_right, src_bottom = src_transform * (width, height)
     try:
         dst_transform, dst_width, dst_height = calculate_default_transform(
-            src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
+            src_crs, dst_crs, width, height,
+            left=min(src_left, src_right), bottom=min(src_top, src_bottom),
+            right=max(src_left, src_right), top=max(src_top, src_bottom),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Геопривязка: calculate_default_transform не сработал: %s", exc)
