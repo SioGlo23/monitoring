@@ -32,26 +32,46 @@ import utils
 logger = logging.getLogger("s2monitor.readiness")
 
 
-def _s2_ready(feat, s2_prods, zakaz, date_str) -> bool:
-    expected = utils.parse_tile_list(feat.get("properties", {}).get("mrgs_tiles"))
-    if expected:
-        found = {utils.extract_s2_tile(p.get("Name", "")) for p in s2_prods}
-        found.discard(None)
-        return expected.issubset(found)
+def _found_tiles(kind: str, prods: list) -> set:
+    if kind == "s2":
+        found = {utils.extract_s2_tile(p.get("Name", "")) for p in prods}
+    else:
+        found = {p.get("PR") for p in prods}
+    found.discard(None)
+    return found
 
-    stable_cycles, count = state_store.update_stability_counter("s2", zakaz, date_str, len(s2_prods))
+
+def _tiles_ready(kind: str, feat, prods, zakaz, date_str) -> bool:
+    """Готовность по списку тайлов в атрибуте области интереса.
+
+    Формат атрибута -- "2 (37UCB, 37UDB)": нужно не менее 2 тайлов, и
+    засчитываются ТОЛЬКО перечисленные в скобках. Старый формат
+    "37UCB, 37UDB" означает "нужны все перечисленные". Если атрибут
+    пуст -- ограничений нет, и готовность определяется стабилизацией
+    числа найденных сцен."""
+    raw = utils.tile_attribute(kind, feat)
+    min_count, expected = utils.parse_tile_spec(raw)
+
+    if expected:
+        matched = _found_tiles(kind, prods) & expected
+        ready = len(matched) >= min_count
+        logger.info(
+            "Заказ %s (%s): найдено %s из %s ожидаемых тайлов, нужно минимум %s -> %s",
+            zakaz, kind, len(matched), len(expected), min_count,
+            "готово" if ready else "ждём",
+        )
+        return ready
+
+    stable_cycles, count = state_store.update_stability_counter(kind, zakaz, date_str, len(prods))
     return count > 0 and stable_cycles >= config.LANDSAT_STABILITY_CYCLES
+
+
+def _s2_ready(feat, s2_prods, zakaz, date_str) -> bool:
+    return _tiles_ready("s2", feat, s2_prods, zakaz, date_str)
 
 
 def _landsat_ready(feat, landsat_prods, zakaz, date_str) -> bool:
-    expected = utils.parse_tile_list(feat.get("properties", {}).get("pr_tile"))
-    if expected:
-        found = {p.get("PR") for p in landsat_prods}
-        found.discard(None)
-        return expected.issubset(found)
-
-    stable_cycles, count = state_store.update_stability_counter("landsat", zakaz, date_str, len(landsat_prods))
-    return count > 0 and stable_cycles >= config.LANDSAT_STABILITY_CYCLES
+    return _tiles_ready("landsat", feat, landsat_prods, zakaz, date_str)
 
 
 def _average_cloud(prods: list):
