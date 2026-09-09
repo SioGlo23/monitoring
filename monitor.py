@@ -48,16 +48,35 @@ from providers import copernicus, modis, usgs_m2m
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("s2monitor.monitor")
 
-_REQUIRED_UTILS_FUNCS = (
-    "now_local", "to_local_readable", "retry", "parse_tile_list",
-    "extract_s2_tile", "detect_landsat_number", "utm_crs_for_shape", "compressed_profile",
-)
-_missing_utils = [name for name in _REQUIRED_UTILS_FUNCS if not hasattr(utils, name)]
-if _missing_utils:
+# Проверка целостности модулей при старте.
+#
+# Зачем: если какой-то файл залился в репозиторий не полностью (такое
+# бывает при копировании через веб-редактор), обрыв всплывает потом в
+# середине прогона невнятной ошибкой вида "module X has no attribute Y",
+# да ещё и молча проглатывается обработчиком ошибок по конкретной зоне.
+# Здесь же мы падаем сразу и говорим прямо, какой файл перезалить.
+_REQUIRED_ATTRS = {
+    "utils": ("now_local", "to_local_readable", "retry", "parse_tile_list", "parse_tile_spec",
+              "tile_attribute", "extract_s2_tile", "detect_landsat_number",
+              "utm_crs_for_shape", "utm_crs_for_s2_tile", "compressed_profile", "sorted_orders"),
+    "readiness": ("evaluate_and_enqueue",),
+    "notifier": ("notify_new_scenes", "notify_processing_summary"),
+    "state_store": ("load_previous_state", "save_state", "update_stability_counter",
+                    "get_all_decisions_for_date"),
+    "storage": ("download_json", "upload_json", "upload_file", "download_to_file", "blob_exists"),
+    "mapping": ("build_map", "save_map"),
+}
+_broken = []
+for _mod_name, _attrs in _REQUIRED_ATTRS.items():
+    _mod = globals().get(_mod_name)
+    _missing = [a for a in _attrs if not hasattr(_mod, a)]
+    if _missing:
+        _broken.append(f"{_mod_name}.py -- нет: {', '.join(_missing)}")
+if _broken:
     raise RuntimeError(
-        f"utils.py в репозитории устарел -- отсутствуют функции: {_missing_utils}. "
-        "Скорее всего, при последнем обновлении файл utils.py не был заменён на актуальную "
-        "версию. Скачайте свежий utils.py и замените им файл в корне репозитория."
+        "Файлы в репозитории неполные или устарели:\n  " + "\n  ".join(_broken) +
+        "\n\nСкорее всего, файл залился обрезанным. Перезалейте перечисленные файлы "
+        "через Add file -> Upload files (не копипастом в веб-редактор)."
     )
 
 
