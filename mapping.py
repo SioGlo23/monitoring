@@ -28,7 +28,7 @@ def build_map(current_s2: dict, current_landsat: dict, aoi_dict: dict):
     minx, miny, maxx, maxy = gdf.total_bounds
     center = [(miny + maxy) / 2, (minx + maxx) / 2]
 
-    m = folium.Map(location=center, zoom_start=5)
+    m = folium.Map(location=center, zoom_start=3)
 
     # Карточки Leaflet по умолчанию расширяются под содержимое: длинное имя
     # сцены -- это один "неразрывный" токен без пробелов, а таблица без
