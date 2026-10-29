@@ -20,6 +20,13 @@ Drive (queue/pending/), которые туда кладёт readiness.py по �
 облачности -- если заданы переменные окружения ZAKAZ_OVERRIDE и
 SATELLITE_OVERRIDE (их выставляет workflow_dispatch в
 .github/workflows/process.yml), опционально DATE_OVERRIDE.
+
+ВРЕМЕННЫЕ СБОИ (обрыв связи, SSL, таймаут, HTTP 429/5xx -- см.
+utils.is_transient_error) не хоронят задание сразу: оно повторяется в
+том же прогоне (config.PROCESS_RETRY_DELAYS_SEC), а если не помогло --
+остаётся в очереди со счётчиком прогонов и ждёт следующего запуска.
+"ОШИБКА ОБРАБОТКИ" уходит только при настоящей ошибке или когда
+исчерпаны config.PROCESS_MAX_RUNS прогонов.
 """
 import logging
 import os
@@ -46,6 +53,8 @@ logger = logging.getLogger("s2monitor.process")
 _REQUIRED_UTILS_FUNCS = (
     "now_local", "to_local_readable", "retry", "parse_tile_list",
     "extract_s2_tile", "detect_landsat_number", "utm_crs_for_shape", "compressed_profile",
+    "TransientError", "is_transient_error", "retry_transient", "short_error", "describe_error",
+    "http_status_of", "backoff_delay",
 )
 _missing_utils = [name for name in _REQUIRED_UTILS_FUNCS if not hasattr(utils, name)]
 if _missing_utils:
@@ -186,6 +195,10 @@ def _get_or_build_landsat_composite(zakaz, p: dict, selected_bands: list, ee_ses
 
 # ============================== Общая обработка задания ==============================
 
+def _job_work_dir(job: dict) -> str:
+    return os.path.join(config.LOCAL_TMP_DIR, "process", f"{job['zakaz']}_{job['date']}_{job['satellite']}")
+
+
 def _process_job(job: dict, aoi_dict: dict) -> dict:
     zakaz = job["zakaz"]
     date_str = job["date"]
@@ -200,8 +213,7 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
     target_crs = utils.utm_crs_for_shape(aoi_shape)
     selected_bands = config.selected_bands(satellite)
 
-    job_id = f"{zakaz}_{date_str}_{satellite}"
-    work_dir = os.path.join(config.LOCAL_TMP_DIR, "process", job_id)
+    work_dir = _job_work_dir(job)
     bands_dir = os.path.join(work_dir, "bands")
     zip_dir = os.path.join(work_dir, "zip")
     composites_dir = os.path.join(work_dir, "composites")
@@ -304,6 +316,83 @@ def _process_job(job: dict, aoi_dict: dict) -> dict:
     return result_links
 
 
+# ============================== Повторы при временных сбоях ==============================
+
+def _process_job_with_retries(job: dict, aoi_dict: dict) -> dict:
+    """_process_job + повторы в том же прогоне при временных сбоях.
+    Рабочая папка между попытками НЕ удаляется -- уже скачанные каналы и
+    собранные композиты берутся с диска, остальное -- с Drive."""
+    delays = config.PROCESS_RETRY_DELAYS_SEC
+    total = len(delays) + 1
+    for attempt in range(1, total + 1):
+        try:
+            return _process_job(job, aoi_dict)
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= total or not utils.is_transient_error(exc):
+                shutil.rmtree(_job_work_dir(job), ignore_errors=True)
+                raise
+            logger.warning(
+                "Заказ %s (%s): временный сбой -- %s. Повтор задания %s/%s через %s с "
+                "(уже готовое будет подхвачено)",
+                job["zakaz"], job["satellite"], utils.short_error(exc), attempt, total - 1, delays[attempt - 1],
+            )
+            traceback.print_exc()
+            time.sleep(delays[attempt - 1])
+
+
+def _failure_text(exc: Exception, attempt_line: str) -> str:
+    """Текст ошибки для уведомления и FAILED_*.json: причина человеческим
+    языком, номер попытки и технические подробности (тип + сообщение,
+    для сбоев Drive -- ещё и шаг, на котором он случился)."""
+    return f"Причина: {utils.describe_error(exc)}\n{attempt_line}\n{utils.short_error(exc)}"
+
+
+def _safe(what: str, fn, *args, **kwargs):
+    """Служебные действия после ошибки (пометить задание, отправить
+    уведомление, записать лог) не должны ронять весь прогон -- иначе
+    остальные задания очереди не обработаются."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("%s: не выполнено -- %s", what, utils.short_error(exc))
+        return None
+
+
+def _handle_queue_failure(job_blob: str, job: dict, exc: Exception) -> bool:
+    """Возвращает True, если задание окончательно провалено (False --
+    отложено до следующего прогона)."""
+    run_no = int(job.get("attempts", 0)) + 1
+    max_runs = config.PROCESS_MAX_RUNS
+    transient = utils.is_transient_error(exc)
+
+    if transient and run_no < max_runs:
+        job["attempts"] = run_no
+        job["last_error"] = _failure_text(exc, f"Прогон {run_no} из {max_runs}")
+        job["last_error_msk"] = utils.now_local().strftime("%Y-%m-%d %H:%M:%S")
+        _safe("Обновление задания в очереди", state_store.write_queue_job, job_blob, job)
+        logger.warning(
+            "Задание %s: временный сбой (%s) -- оставлено в очереди до следующего прогона (прогон %s из %s), "
+            "уведомление об ошибке не отправляется",
+            job_blob, utils.short_error(exc), run_no, max_runs,
+        )
+        _safe("Лог операции", process_log.log_operation,
+              job["zakaz"], "Завершение заказа (отложено -- временный сбой)", None, 0.0, "ERROR")
+        return False
+
+    if transient:
+        attempt_line = f"Попытка {run_no} из {max_runs} -- попытки исчерпаны"
+    else:
+        attempt_line = f"Попытка {run_no} из {max_runs} (ошибка не временная -- без повторов)"
+    error_text = _failure_text(exc, attempt_line)
+
+    _safe("Перенос задания в FAILED", state_store.mark_job_failed, job_blob, job, error_text)
+    all_decisions = _safe("Чтение решений", state_store.get_all_decisions_for_date, job["date"])
+    _safe("Уведомление об ошибке", notifier.notify_processing_failed,
+          job["zakaz"], job["date"], job["satellite"], error_text, all_decisions)
+    _safe("Лог операции", process_log.log_operation, job["zakaz"], "Завершение заказа (ошибка)", None, 0.0, "ERROR")
+    return True
+
+
 # ============================== Точки входа ==============================
 
 def _run_queue() -> dict:
@@ -313,25 +402,27 @@ def _run_queue() -> dict:
         return {"jobs_processed": 0, "jobs_failed": 0}
 
     aoi_dict = aoi_source.load_aoi_dict()
-    processed, failed = 0, 0
+    processed, failed, deferred = 0, 0, 0
 
     for job_blob, job in jobs:
         try:
-            result = _process_job(job, aoi_dict)
-            state_store.mark_job_done(job_blob, job)
-            all_decisions = state_store.get_all_decisions_for_date(job["date"])
-            notifier.notify_processing_done(job["zakaz"], job["date"], job["satellite"], result, all_decisions)
-            processed += 1
+            result = _process_job_with_retries(job, aoi_dict)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Задание %s завершилось с ошибкой: %s", job_blob, exc)
+            logger.error("Задание %s завершилось с ошибкой: %s", job_blob, utils.short_error(exc))
             traceback.print_exc()
-            state_store.mark_job_failed(job_blob, job, str(exc))
-            all_decisions = state_store.get_all_decisions_for_date(job["date"])
-            notifier.notify_processing_failed(job["zakaz"], job["date"], job["satellite"], str(exc), all_decisions)
-            process_log.log_operation(job["zakaz"], "Завершение заказа (ошибка)", None, 0.0, "ERROR")
-            failed += 1
+            if _handle_queue_failure(job_blob, job, exc):
+                failed += 1
+            else:
+                deferred += 1
+            continue
 
-    return {"jobs_processed": processed, "jobs_failed": failed}
+        _safe("Перенос задания в done", state_store.mark_job_done, job_blob, job)
+        all_decisions = _safe("Чтение решений", state_store.get_all_decisions_for_date, job["date"])
+        _safe("Уведомление о готовности", notifier.notify_processing_done,
+              job["zakaz"], job["date"], job["satellite"], result, all_decisions)
+        processed += 1
+
+    return {"jobs_processed": processed, "jobs_failed": failed, "jobs_deferred": deferred}
 
 
 def _run_manual(zakaz: str, satellite: str, date_override: str = None) -> dict:
@@ -363,16 +454,20 @@ def _run_manual(zakaz: str, satellite: str, date_override: str = None) -> dict:
 
     job = {"zakaz": str(zakaz), "date": monitor_date, "satellite": satellite, "products": products}
     try:
-        result = _process_job(job, aoi_dict)
-        all_decisions = state_store.get_all_decisions_for_date(monitor_date)
-        notifier.notify_processing_done(zakaz, monitor_date, satellite, result, all_decisions)
-        return {"jobs_processed": 1, "jobs_failed": 0}
+        result = _process_job_with_retries(job, aoi_dict)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
-        all_decisions = state_store.get_all_decisions_for_date(monitor_date)
-        notifier.notify_processing_failed(zakaz, monitor_date, satellite, str(exc), all_decisions)
-        process_log.log_operation(zakaz, "Завершение заказа (ошибка)", None, 0.0, "ERROR")
+        error_text = _failure_text(exc, "Ручной запуск")
+        all_decisions = _safe("Чтение решений", state_store.get_all_decisions_for_date, monitor_date)
+        _safe("Уведомление об ошибке", notifier.notify_processing_failed,
+              zakaz, monitor_date, satellite, error_text, all_decisions)
+        _safe("Лог операции", process_log.log_operation, zakaz, "Завершение заказа (ошибка)", None, 0.0, "ERROR")
         return {"jobs_processed": 0, "jobs_failed": 1}
+
+    all_decisions = _safe("Чтение решений", state_store.get_all_decisions_for_date, monitor_date)
+    _safe("Уведомление о готовности", notifier.notify_processing_done,
+          zakaz, monitor_date, satellite, result, all_decisions)
+    return {"jobs_processed": 1, "jobs_failed": 0}
 
 
 def run_once() -> dict:

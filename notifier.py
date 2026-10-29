@@ -245,5 +245,5 @@ def notify_processing_failed(zakaz, date_str, satellite, error: str, all_decisio
 
     tg.broadcast_by_order(
         "ОШИБКА ОБРАБОТКИ",
-        {str(zakaz): [f"  • {satellite}, дата {date_str}", f"    {error}"]},
+        {str(zakaz): [f"  • {satellite}, дата {date_str}"] + [f"    {line}" for line in str(error).splitlines()]},
     )

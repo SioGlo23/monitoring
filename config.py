@@ -170,6 +170,18 @@ LANDSAT_STABILITY_CYCLES = int(os.environ.get("LANDSAT_STABILITY_CYCLES", "2"))
 # для Landsat -- по всем найденным/из pr_tile).
 CLOUD_THRESHOLD_PERCENT = float(os.environ.get("CLOUD_THRESHOLD_PERCENT", "70"))
 
+# Повторы задания при ВРЕМЕННЫХ сбоях (обрыв связи, SSL, таймаут, HTTP
+# 429/5xx) -- см. process.py. Сначала задание повторяется в том же
+# прогоне с паузами из PROCESS_RETRY_DELAYS_SEC (уже готовые каналы/
+# композиты подхватываются, так что это дёшево). Если не помогло --
+# задание остаётся в queue/pending/ и его заберёт следующий прогон
+# process.yml. "ОШИБКА ОБРАБОТКИ" отправляется только когда исчерпаны
+# PROCESS_MAX_RUNS прогонов (или сразу -- при настоящей, не сетевой ошибке).
+PROCESS_RETRY_DELAYS_SEC = tuple(
+    int(x) for x in os.environ.get("PROCESS_RETRY_DELAYS_SEC", "60,180").split(",") if x.strip()
+)
+PROCESS_MAX_RUNS = int(os.environ.get("PROCESS_MAX_RUNS", "3"))
+
 # Куда сохранять квиклуки (загрубленные превью) новых сцен
 QUICKLOOKS_PREFIX = os.environ.get("QUICKLOOKS_PREFIX", "logs/quicklooks")
 
