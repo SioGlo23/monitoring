@@ -15,6 +15,7 @@ import rasterio
 import requests
 from rasterio.warp import Resampling, reproject
 
+import utils
 from providers import copernicus
 
 logger = logging.getLogger("s2monitor.pipeline.s2_download")
@@ -156,7 +157,9 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
     logger.info("Читаю manifest.safe для %s...", prod_name[:40])
     cdse.probe_node_style(prod_id, [safe_name, "manifest.safe"])
     if not cdse.download_node_file(prod_id, [safe_name, "manifest.safe"], manifest_path):
-        raise RuntimeError(f"Не удалось скачать manifest.safe для {prod_name}")
+        raise utils.TransientError(
+            f"CDSE [скачивание manifest.safe для {prod_name}]: не скачан после {_HTTP_RETRIES} попыток"
+        )
 
     root = ET.parse(manifest_path).getroot()
 
@@ -171,7 +174,7 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
     if not band_paths:
         raise RuntimeError(f"В manifest.safe не найдены каналы: {selected_bands}")
 
-    downloaded = []
+    downloaded, failed = [], []
     for band, rel_path in band_paths.items():
         local_path = os.path.join(out_dir, f"{band}.jp2")
         if _is_valid_jp2(local_path):
@@ -183,9 +186,18 @@ def download_selected_bands(prod: dict, selected_bands: list, out_dir: str) -> s
             downloaded.append(local_path)
         else:
             logger.error("Не удалось скачать канал %s для %s", band, prod_name)
+            failed.append(band)
 
-    if not downloaded:
-        raise RuntimeError(f"Ни один канал не скачан для {prod_name}")
+    # Канал, который есть в сцене, но не скачался, -- это сбой связи с
+    # CDSE, а не повод собирать композит из меньшего числа каналов:
+    # неполный композит лёг бы на Drive под полным именем и потом
+    # подхватывался бы как готовый. Уже скачанные каналы остаются на
+    # диске и при повторе задания не перекачиваются.
+    if failed:
+        raise utils.TransientError(
+            f"CDSE [скачивание {prod_name}]: не скачаны каналы {', '.join(failed)} "
+            f"после {_HTTP_RETRIES} попыток"
+        )
     if len(downloaded) < len(selected_bands):
         logger.warning("Скачано %s/%s каналов для %s -- продолжаем с тем, что есть", len(downloaded), len(selected_bands), prod_name)
 

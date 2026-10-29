@@ -17,6 +17,7 @@ import tarfile
 import requests
 
 import config
+import utils
 
 logger = logging.getLogger("s2monitor.pipeline.landsat_download")
 
@@ -32,6 +33,11 @@ _HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; SatMonitorService/1.0)",
     "Accept": "application/json",
 }
+
+# Повторы скачивания одного файла (бандла/канала) при обрывах связи.
+_DOWNLOAD_ATTEMPTS = 5
+# (подключение, ожидание очередной порции данных), сек.
+_DOWNLOAD_TIMEOUT = (30, 300)
 
 
 def dataset_download_options(m2m_session_id: str) -> dict:
@@ -99,23 +105,56 @@ def ee_logout(session: requests.Session) -> None:
 
 def _ee_download_by_product_id(session: requests.Session, product_id: str, entity_id: str,
                                 out_dir: str, label: str) -> str:
-    url = _EE_DOWNLOAD_URL.format(data_product_id=product_id, entity_id=entity_id)
-    with session.get(url, allow_redirects=False, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        data = r.json()
-    if data.get("errorMessage"):
-        raise RuntimeError(data["errorMessage"])
-    download_url = data.get("url")
-    if not download_url:
-        raise RuntimeError("сервер не вернул прямую ссылку на файл")
+    """Скачивает файл через EarthExplorer в out_dir/label.
 
+    Пишет во временный label.part и переименовывает только после полного
+    скачивания -- недокачанный файл никогда не окажется под итоговым
+    именем (иначе повтор задания принял бы его за готовый канал). При
+    обрыве связи -- повтор с докачкой с места обрыва (заголовок Range),
+    если сервер её поддерживает; иначе файл качается заново. Ссылка на
+    файл запрашивается заново на каждой попытке (она временная)."""
+    url = _EE_DOWNLOAD_URL.format(data_product_id=product_id, entity_id=entity_id)
     os.makedirs(out_dir, exist_ok=True)
     fp = os.path.join(out_dir, label)
-    with session.get(download_url, stream=True, allow_redirects=True, timeout=600) as r:
-        r.raise_for_status()
-        with open(fp, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
+    tmp = fp + ".part"
+    if os.path.exists(tmp):
+        os.remove(tmp)  # остаток чужого/прошлого скачивания -- не докачиваем
+
+    def _attempt():
+        with session.get(url, allow_redirects=False, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            data = r.json()
+        if data.get("errorMessage"):
+            raise RuntimeError(data["errorMessage"])
+        download_url = data.get("url")
+        if not download_url:
+            raise RuntimeError("сервер не вернул прямую ссылку на файл")
+
+        offset = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        with session.get(download_url, headers=headers, stream=True, allow_redirects=True,
+                         timeout=_DOWNLOAD_TIMEOUT) as r:
+            if offset and r.status_code == 416:
+                return  # всё уже скачано на прошлой попытке
+            r.raise_for_status()
+            if offset and r.status_code != 206:
+                logger.info("%s: сервер не поддерживает докачку -- качаю заново", label)
+                offset = 0
+            elif offset:
+                logger.info("%s: докачка с %.1f МБ", label, offset / (1024 * 1024))
+            with open(tmp, "ab" if offset else "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    if chunk:
+                        f.write(chunk)
+
+    try:
+        utils.retry_transient(
+            _attempt, f"EarthExplorer [скачивание {label}]", attempts=_DOWNLOAD_ATTEMPTS, logger=logger,
+        )
+        os.replace(tmp, fp)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return fp
 
 
@@ -135,7 +174,9 @@ def download_bundle(ee_session: requests.Session, entity_id: str, sid: str, zip_
             return bundle_path
         except Exception as e:  # noqa: BLE001
             last_error = e
-    raise RuntimeError(f"Не удалось скачать бандл {sid}: {last_error}")
+    # "from": если причина -- сбой связи, задание будет считаться временно
+    # неудавшимся и повторится (см. utils.is_transient_error).
+    raise RuntimeError(f"Не удалось скачать бандл {sid}: {utils.short_error(last_error)}") from last_error
 
 
 def download_band_direct(ee_session: requests.Session, product_catalog: dict, entity_id: str,
