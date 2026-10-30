@@ -36,11 +36,10 @@ import os
 import threading
 
 import google_auth_httplib2
-import httplib2
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload, build_http
 
 import config
 import utils
@@ -99,8 +98,16 @@ def _get_credentials():
 
 def _new_http():
     """Новое HTTP-соединение с Drive: явный таймаут + авторизация по
-    refresh-токену (access-токен обновляется автоматически)."""
-    return google_auth_httplib2.AuthorizedHttp(_get_credentials(), http=httplib2.Http(timeout=_HTTP_TIMEOUT))
+    refresh-токену (access-токен обновляется автоматически).
+
+    ВАЖНО: соединение строится через build_http() библиотеки Google, а не
+    голым httplib2.Http(). build_http() убирает код 308 из списка
+    перенаправлений: Drive отвечает 308 на каждый принятый кусок
+    resumable-загрузки, а голый httplib2 принимает его за редирект и
+    падает с RedirectMissingLocation на любом файле больше одного куска."""
+    http = build_http()
+    http.timeout = _HTTP_TIMEOUT
+    return google_auth_httplib2.AuthorizedHttp(_get_credentials(), http=http)
 
 
 def _get_service():
